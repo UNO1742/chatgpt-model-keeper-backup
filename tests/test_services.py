@@ -1,6 +1,6 @@
+import base64
 import copy
 import hashlib
-import io
 import json
 from pathlib import Path
 import shutil
@@ -69,23 +69,27 @@ class Services(unittest.TestCase):
             folder=app.prepare_extension_install()
             self.assertTrue((folder/'manifest.json').is_file())
             launch.assert_called_once_with('microsoft-edge:edge://extensions/')
-    def test_signed_crx_matches_manifest_key(self):
+    def test_unpacked_deploy_pins_key_and_marks_state(self):
         import extension_deploy as deploy
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);folder=root/'extension'
             shutil.copytree(app.ASSETS/'extension',folder)
-            ext_id,version=deploy.pack(folder,root/'extension.crx',root)
-            manifest=json.loads((folder/'manifest.json').read_text(encoding='utf-8'))
-            self.assertEqual(ext_id,deploy.folder_id(folder))
-            self.assertEqual(version,manifest['version'])
+            manifest=deploy.sync_manifest(folder,root)
+            ext_id=deploy.identifier(base64.b64decode(manifest['key']))
             self.assertEqual(len(ext_id),32)
-            data=(root/'extension.crx').read_bytes()
-            self.assertEqual(data[:4],b'Cr24')
-            self.assertEqual(struct.unpack('<I',data[4:8])[0],3)
-            payload=data[12+struct.unpack('<I',data[8:12])[0]:]
-            self.assertEqual(json.loads(zipfile.ZipFile(io.BytesIO(payload)).read('manifest.json'))['key'],manifest['key'])
-            # Repacking from the stored machine key keeps the identifier stable.
-            self.assertEqual(deploy.pack(folder,root/'second.crx',root)[0],ext_id)
+            self.assertEqual(ext_id,deploy.folder_id(folder))
+            # A stored machine key keeps the identifier stable across re-syncs.
+            self.assertEqual(deploy.sync_manifest(folder,root)['key'],manifest['key'])
+            deploy._write_marker(root,ext_id,manifest['version'],folder)
+            self.assertTrue(deploy.registered(root))
+            self.assertEqual(deploy.state(root)['id'],ext_id)
+            deploy._marker_path(root).unlink()
+            self.assertFalse(deploy.registered(root))
+    def test_deploy_refuses_missing_extension_folder(self):
+        import extension_deploy as deploy
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                deploy.deploy(Path(directory),Path(directory)/'missing')
     def test_extension_origins_dedupe_installed_and_bundled_keys(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app,'ROOT',Path(directory)):
             folder=app.ROOT/'extension';folder.mkdir()

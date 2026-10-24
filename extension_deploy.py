@@ -1,35 +1,37 @@
-"""Deploy the companion Edge extension without developer mode.
+"""Load the companion Edge extension without the store, developer mode or clicks.
 
-Chromium browsers read externally installed extensions from the registry
-(HKCU\\Software\\Microsoft\\Edge\\Extensions\\<id> with `path` + `version`), scan it
-on browser start and install the referenced CRX without asking for developer
-mode. The CRX3 file must be signed, so this module mints one RSA key per machine
-and writes its public half into the installed manifest. That public key decides
-the extension ID, which keeps the native messaging allow-list consistent
-without shipping any signing secret with the app.
+Edge 156 refuses side-loading in every classic way that used to work:
 
-Format reference: Chrome's CRX3 header (Cr24 / protobuf CrxFileHeader). An
-equivalent PyPI implementation exists as `crx3` (MIT); this module stays
-dependency-free so the frozen build carries no extra crypto stack.
+* an externally installed CRX (``HKCU\\Software\\Microsoft\\Edge\\Extensions``) is
+  accepted at first, marked "not verified" and its unpacked files are purged
+  afterwards, so the extension never actually runs;
+* writing the enabled state into ``Secure Preferences`` is pointless, because the
+  per-extension MAC in ``protection.macs`` is recomputed from an internal seed;
+* ``ExtensionInstallForcelist`` only force-installs store or managed extensions.
+
+What does work is the command line Edge itself uses for "load unpacked": start
+the browser once with ``--load-extension=<folder>``. Edge registers the folder as
+an unpacked extension, which keeps working on the following starts, and no
+browser UI is involved. So deployment is: pin the manifest key (stable ID that
+matches the native messaging allow-list), then restart Edge with that flag.
+
+The RSA key is still minted per machine: the public half goes into the installed
+manifest and decides the extension ID, so no signing secret ships with the app
+and every machine gets a stable, predictable ID.
 """
 import base64
 import hashlib
-import io
 import json
 import os
-import struct
 import subprocess
 import time
 import winreg
-import zipfile
 from pathlib import Path
 
-EDGE_KEY = 'Software\\Microsoft\\Edge\\Extensions'
 KEY_FILE = 'extension_key.json'
-CRX_FILE = 'extension.crx'
+MARKER_FILE = 'extension_state.json'
 RSA_BITS = 2048
-SIGNATURE_CONTEXT = b'CRX3 SignedData\x00'
-DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
+LOAD_FLAG = '--load-extension='
 _NO_WINDOW = 0x08000000
 
 
@@ -56,26 +58,6 @@ def public_key(n, e):
     rsa = _der(0x30, _der_integer(n) + _der_integer(e))
     algorithm = _der(0x30, bytes.fromhex('06092A864886F70D010101') + b'\x05\x00')
     return _der(0x30, algorithm + _der(0x03, b'\x00' + rsa))
-
-
-def _varint(value):
-    out = bytearray()
-    while True:
-        block = value & 0x7f
-        value >>= 7
-        out.append(block | (0x80 if value else 0))
-        if not value:
-            return bytes(out)
-
-
-def _field(number, payload):
-    return _varint((number << 3) | 2) + _varint(len(payload)) + payload
-
-
-def _sign(data, n, d):
-    digest = DIGEST_INFO + hashlib.sha256(data).digest()
-    block = b'\x00\x01' + b'\xff' * (RSA_BITS // 8 - len(digest) - 3) + b'\x00' + digest
-    return pow(int.from_bytes(block, 'big'), d, n).to_bytes(RSA_BITS // 8, 'big')
 
 
 def identifier(public):
@@ -141,86 +123,82 @@ def sync_manifest(folder, root):
     return manifest
 
 
-def _payload(folder):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(Path(folder).rglob('*')):
-            if path.is_file():
-                archive.write(path, path.relative_to(folder).as_posix())
-    return buffer.getvalue()
+def edge_profile_roots():
+    """Every `User Data` directory Edge may keep a profile in."""
+    local = os.environ.get('LOCALAPPDATA')
+    candidates = []
+    if local:
+        candidates.append(Path(local) / 'Microsoft' / 'Edge' / 'User Data')
+        candidates.append(Path(local) / 'Microsoft' / 'Edge Beta' / 'User Data')
+    return [path for path in candidates if path.is_dir()]
 
 
-def pack(folder, target, root):
-    """Write a signed CRX3 next to the extension and return (id, version)."""
-    folder = Path(folder)
-    manifest = sync_manifest(folder, root)
-    n, d, e = load_key(root)
-    public = public_key(n, e)
-    crx_id = hashlib.sha256(public).digest()[:16]
-    payload = _payload(folder)
-    signed_header = _field(1, crx_id)
-    signature = _sign(SIGNATURE_CONTEXT + struct.pack('<I', len(signed_header)) + signed_header + payload, n, d)
-    header = _field(2, _field(1, public) + _field(2, signature)) + _field(10000, signed_header)
-    target = Path(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + '.part')
-    temporary.write_bytes(b'Cr24' + struct.pack('<II', 3, len(header)) + header + payload)
-    os.replace(temporary, target)
-    return identifier(public), str(manifest.get('version', '1.0'))
+def _profile_files():
+    files = []
+    for root in edge_profile_roots():
+        for pref in root.glob('*/Secure Preferences'):
+            files.append(pref)
+    return files
 
 
-def registered(ext_id):
+def _read_entry(pref, ext_id):
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, EDGE_KEY + '\\' + ext_id) as key:
-            path, _ = winreg.QueryValueEx(key, 'path')
-            version, _ = winreg.QueryValueEx(key, 'version')
-            return {'path': path, 'version': version}
-    except (FileNotFoundError, OSError):
+        data = json.loads(pref.read_text(encoding='utf-8', errors='replace'))
+    except (OSError, ValueError):
         return None
+    entry = data.get('extensions', {}).get('settings', {}).get(ext_id)
+    if not entry:
+        return None
+    return {'enabled': not entry.get('disable_reasons') and entry.get('state', 1) == 1,
+            'version': str(entry.get('manifest', {}).get('version', '')),
+            'location': entry.get('location'),
+            'file': str(pref)}
+
+
+def live_state(ext_id):
+    """Whether Edge currently knows this extension, as far as the profile says."""
+    if not ext_id:
+        return None
+    for pref in _profile_files():
+        entry = _read_entry(pref, ext_id)
+        if entry:
+            return entry
+    return None
+
+
+def _marker_path(root):
+    return Path(root) / MARKER_FILE
+
+
+def marker(root):
+    try:
+        return json.loads(_marker_path(root).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+
+
+def registered(root):
+    """True while this machine is marked as deployed (used for UI state)."""
+    root = Path(root)
+    return bool(marker(root).get('id')) and (root / 'extension' / 'manifest.json').is_file()
+
+
+def _write_marker(root, ext_id, version, folder):
+    _marker_path(root).write_text(json.dumps({'id': ext_id, 'version': version,
+                                              'folder': str(folder),
+                                              'deployed': time.strftime('%Y-%m-%dT%H:%M:%S')},
+                                             ensure_ascii=False), encoding='utf-8')
 
 
 def state(root):
     """What the settings card needs to render install / uninstall."""
     root = Path(root)
     ext_id = folder_id(root / 'extension')
-    entry = registered(ext_id) if ext_id else None
-    return {'installed': bool(entry), 'id': ext_id, 'version': (entry or {}).get('version', ''),
-            'running': edge_running()}
-
-
-def deploy(root, folder=None):
-    """Pack and register the extension. Safe to call repeatedly."""
-    root = Path(root)
-    folder = Path(folder or root / 'extension')
-    if not (folder / 'manifest.json').is_file():
-        raise RuntimeError('扩展文件缺失，请重新安装本程序。')
-    crx = root / CRX_FILE
-    manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
-    version = str(manifest.get('version', '1.0'))
-    ext_id = identifier(base64.b64decode(sync_manifest(folder, root)['key']))
-    stale = not crx.is_file() or (registered(ext_id) or {}).get('version') != version
-    if not stale:
-        newest = max((path.stat().st_mtime for path in folder.rglob('*') if path.is_file()), default=0)
-        stale = newest > crx.stat().st_mtime
-    if stale:
-        ext_id, version = pack(folder, crx, root)
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, EDGE_KEY + '\\' + ext_id) as key:
-        winreg.SetValueEx(key, 'path', 0, winreg.REG_SZ, str(crx))
-        winreg.SetValueEx(key, 'version', 0, winreg.REG_SZ, version)
-    return {'installed': True, 'id': ext_id, 'version': version, 'running': edge_running()}
-
-
-def remove(root):
-    """Drop the registry entry; Chromium uninstalls it on the next start."""
-    root = Path(root)
-    ext_id = folder_id(root / 'extension')
-    if not ext_id:
-        return {'installed': False, 'id': '', 'version': '', 'running': edge_running()}
-    try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, EDGE_KEY + '\\' + ext_id)
-    except FileNotFoundError:
-        pass
-    return {'installed': False, 'id': ext_id, 'version': '', 'running': edge_running()}
+    data = marker(root)
+    deployed = bool(data) and (root / 'extension' / 'manifest.json').is_file()
+    live = live_state(ext_id)
+    return {'installed': bool(deployed), 'enabled': bool(live and live['enabled']),
+            'id': ext_id, 'version': data.get('version', ''), 'running': edge_running()}
 
 
 def edge_running():
@@ -234,23 +212,111 @@ def edge_running():
 
 
 def edge_binary():
-    for candidate in (Path(os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)')) / 'Microsoft/Edge/Application/msedge.exe',
-                      Path(os.environ.get('PROGRAMFILES', r'C:\Program Files')) / 'Microsoft/Edge/Application/msedge.exe'):
+    for base in (os.environ.get('PROGRAMFILES(X86)'), os.environ.get('PROGRAMFILES'),
+                 r'C:\Program Files (x86)', r'C:\Program Files'):
+        if not base:
+            continue
+        candidate = Path(base) / 'Microsoft' / 'Edge' / 'Application' / 'msedge.exe'
         if candidate.is_file():
             return candidate
     return None
 
 
-def restart_edge():
-    """Close Edge gracefully and reopen it so the registry scan runs again."""
+def _close_edge(timeout=25):
+    subprocess.run(['taskkill', '/IM', 'msedge.exe'], capture_output=True, timeout=20,
+                   creationflags=_NO_WINDOW if os.name == 'nt' else 0)
+    for _ in range(timeout * 5):
+        if not edge_running():
+            return True
+        time.sleep(0.2)
+    return not edge_running()
+
+
+def _launch(extra=()):
     binary = edge_binary()
     if not binary:
         raise RuntimeError('未找到 Microsoft Edge。')
-    subprocess.run(['taskkill', '/IM', 'msedge.exe'], capture_output=True, timeout=20,
-                   creationflags=_NO_WINDOW if os.name == 'nt' else 0)
-    for _ in range(30):
-        if not edge_running():
-            break
-        time.sleep(0.2)
-    subprocess.Popen([str(binary)], creationflags=_NO_WINDOW if os.name == 'nt' else 0)
-    return {'restarted': True, 'running': True}
+    subprocess.Popen([str(binary), *extra], creationflags=_NO_WINDOW if os.name == 'nt' else 0)
+    return True
+
+
+def deploy(root, folder=None, restart=True):
+    """Register the folder as an unpacked extension and (optionally) restart Edge.
+
+    `restart=False` never closes a browser the user is working in: the marker is
+    written and, when Edge happens to be closed, the flag is applied right away.
+    """
+    root = Path(root)
+    folder = Path(folder or root / 'extension')
+    if not (folder / 'manifest.json').is_file():
+        raise RuntimeError('扩展文件缺失，请重新安装本程序。')
+    manifest = sync_manifest(folder, root)
+    ext_id = identifier(base64.b64decode(manifest['key']))
+    version = str(manifest.get('version', '1.0'))
+    was_running = edge_running()
+    if was_running and not restart:
+        _write_marker(root, ext_id, version, folder)
+        return {'installed': True, 'enabled': False, 'id': ext_id, 'version': version,
+                'running': True, 'restarted': False, 'needsRestart': True}
+    if was_running:
+        _close_edge()
+    _launch([LOAD_FLAG + str(folder)])
+    _write_marker(root, ext_id, version, folder)
+    return {'installed': True, 'enabled': True, 'id': ext_id, 'version': version,
+            'running': True, 'restarted': was_running}
+
+
+def refresh(root, folder=None):
+    """Re-apply after an app update, but never resurrect a removed extension.
+
+    Runs at every start, so it must not close a browser the user is using: an
+    extension Edge already knows about is left alone, and a missing one is only
+    applied while Edge is closed.
+    """
+    root = Path(root)
+    data = marker(root)
+    if not data:
+        return {'installed': False, 'enabled': False, 'id': '', 'version': '', 'running': edge_running()}
+    ext_id = folder_id(root / 'extension') or data.get('id', '')
+    live = live_state(ext_id)
+    if live and live['enabled']:
+        return {'installed': True, 'enabled': True, 'id': ext_id,
+                'version': live['version'] or data.get('version', ''), 'running': edge_running()}
+    return deploy(root, folder, restart=False)
+
+
+def remove(root):
+    """Close Edge, forget the unpacked entry and drop the marker."""
+    root = Path(root)
+    ext_id = folder_id(root / 'extension') or marker(root).get('id', '')
+    if edge_running():
+        _close_edge()
+    for pref in _profile_files():
+        try:
+            data = json.loads(pref.read_text(encoding='utf-8', errors='replace'))
+        except (OSError, ValueError):
+            continue
+        settings = data.get('extensions', {}).get('settings', {})
+        if ext_id not in settings:
+            continue
+        settings.pop(ext_id, None)
+        macs = data.get('protection', {}).get('macs', {}).get('extensions', {}).get('settings', {})
+        macs.pop(ext_id, None)
+        try:
+            pref.write_text(json.dumps(data, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+        except OSError:
+            continue
+    try:
+        _marker_path(root).unlink()
+    except FileNotFoundError:
+        pass
+    return {'installed': False, 'enabled': False, 'id': ext_id, 'version': '', 'running': edge_running()}
+
+
+def restart_edge():
+    """Plain restart, used by the "restart Edge" menu entry."""
+    was_running = edge_running()
+    if was_running:
+        _close_edge()
+    _launch()
+    return {'restarted': was_running, 'running': True}

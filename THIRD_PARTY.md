@@ -35,10 +35,18 @@ Extension packaging below). No account credential is included.
 
 ## Extension packaging
 
-`extension_deploy.py` writes the CRX3 container described by Chromium's
-`crx_file` format (magic `Cr24`, version 3, protobuf `CrxFileHeader` with
-`sha256_with_rsa`) and signs it with an RSA-2048 key minted per machine on first
-deployment. The key pair stays in the local install directory; only the public
-half reaches the extension manifest. Packaging is written in-tree with the
-standard library, so the frozen build carries no extra crypto stack. The PyPI
-package `crx3` (MIT) implements the same format if a reference is needed.
+`extension_deploy.py` no longer ships a CRX. Edge 156 rejects off-store CRX
+installs (the extension is marked "not verified" and its unpacked files are
+purged afterwards), and the enabled flag in `Secure Preferences` is protected by
+a per-extension MAC, so neither can be used for silent deployment. The module
+instead registers the folder the same way "load unpacked" does, by starting Edge
+once with `--load-extension=<folder>`, which leaves a normal unpacked entry that
+survives later starts.
+
+An RSA-2048 key is minted per machine on first deployment and only its public
+half is written into the extension manifest, which fixes the extension ID and
+keeps the native messaging allow-list stable. Everything is standard library:
+SubjectPublicKeyInfo is encoded by hand, and the key itself is generated through
+the .NET RSA provider that ships with Windows, so the frozen build carries no
+extra crypto stack. The `crx3` PyPI package (MIT) is the reference implementation
+of the CRX3 container this project used before.

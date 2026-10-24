@@ -1,0 +1,98 @@
+ChatGPT Model Keeper - source package
+
+文件：
+app.py                    每用户安装、Native Messaging 主机、启动项管理
+floating.py               64px 悬浮球、336px 设置卡片、拖动位置、单实例事件
+extension/manifest.json   MV3 扩展；固定公钥维持扩展 ID
+extension/background.js   Native Messaging 长连接；请求 ID 与超时管理
+extension/content.js      ChatGPT 新版模型菜单 DOM 适配器
+extension/popup.*          立即重新检测入口
+tests/fixture.html        根据当前菜单结构编写的受控测试页面
+tests/test_adapter.py     DOM 适配器自动化验证
+tests/test_packaged.py    打包 EXE、安装流程和独立 Edge 端到端测试
+build.ps1                 PyInstaller 单文件窗口程序构建
+
+构建环境：Windows x64，Python 3.13.6，Tkinter，PyInstaller 6.22.3。
+在源码目录运行：
+  python -m pip install -r requirements-build.txt
+  powershell -NoProfile -File build.ps1
+结果：dist/ModelKeeper.exe
+EXE 已包含 Python、Tk 和 extension，不需要目标机器单独装运行时。
+
+测试依赖：playwright==1.64.1
+  python -m pip install playwright==1.64.1
+  python -m playwright install chromium
+  python tests/test_floating.py
+  python tests/test_adapter.py
+  python tests/test_packaged.py
+完整链路测试还需要已安装的 Microsoft Edge。
+test_packaged.py 临时写入当前用户本程序的 Edge 本机消息接口和卸载登记，
+在 finally 恢复原值；使用独立临时 Edge 用户目录与拦截的测试页面。
+建议在没有本工具实例运行的测试 Windows 用户中执行。
+
+命令行：
+  ModelKeeper.exe                显示圆形悬浮球
+  ModelKeeper.exe --startup      登录时启动悬浮球，不弹出设置
+  ModelKeeper.exe --autostart on/off  启用/关闭当前用户登录自启
+  ModelKeeper.exe --install      每用户安装，不显示 GUI
+  ModelKeeper.exe --native       本机消息协议模式，stdin/stdout 为长度前缀 JSON
+  ModelKeeper.exe --selftest     基础资源自检，以退出码返回
+  ModelKeeper.exe --uninstall    移除安装登记并提示手动清理文件
+
+Native host：local.chatgpt.modelkeeper
+HKCU\Software\Microsoft\Edge\NativeMessagingHosts\local.chatgpt.modelkeeper
+原生进程允许的扩展 origin 由清单公钥计算，只允许这个扩展 ID。
+host.json 路径指向每用户安装目录中的 EXE，不依赖原下载位置。
+设置保存采用临时文件 + os.replace，保证后台读取一致。
+
+适配边界：
+使用 data-codex-intelligence-trigger、aria-pressed、aria-labelledby、
+menuitemradio 的 aria-checked、data-reasoning-slider 的键盘操作和状态播报。
+隐藏的 inert 列表只用于读取当前模型；点击目标前必须显示该模型列表。
+强度按播报的中英文含义匹配，不依赖 Chat / Work 的内部代码是否一致。
+PointerEvent 顺序兼容 Radix 的 pointerdown 触发器。
+不使用 React 私有状态、逆向接口、网络拦截或硬编码账户令牌。
+
+维护：网页 DOM 变更时更新 content.js 和 fixture，重新运行测试并打包。
+manifest 公钥只是扩展身份，不是账户密钥；源码包不含对应私钥。
+此包没有商店发布配置、自动更新、遥测或商业代码签名。
+
+发布前可进一步在不同账号、不同 Edge 版本及另一台 Windows 电脑验收。
+
+1.1 UI / startup notes:
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run\ChatGPTModelKeeper
+值为带引号的安装 EXE 路径加 --startup。仅修改本程序值，不改变系统自启策略。
+首次 1.1 安装/迁移默认开启；startup.json 标记已配置，更新保留关闭选择。
+卸载移除 Run 值。测试会备份并恢复原本的 Run 值。
+GUI 使用每个安装目录独立的 Local 命名 mutex + 自动重置 event，重复启动唤出
+同一个设置卡片；浏览器 Native Messaging 主机不参与 GUI mutex。
+悬浮球使用 Windows 透明色和无边框置顶窗口，面板与球保持独立。
+
+1.2 artwork:
+orb_renderer.py 使用 UpdateLayeredWindow 和预乘 BGRA DIB，逐像素 Alpha 避免
+透明色法带来的紫色边缘。144×64×64×4 字节帧压缩约 460KB，解压后约 2.25MB。
+运行时只依赖 Python 标准库 + Tk，不依赖 numpy、Pillow、WebGL 或网络服务。
+generate_orb.py 是原创程序化美术生成器，构建时可用 numpy==2.3.4、Pillow==11.3.0
+重新生成 assets/orb.frames；现成帧已包含在源码包。24fps，6秒一循环。
+动效以蓝白云雾流动和轻微呼吸复现参考风格，不是官方逐帧动画。
+
+1.2.1 installation path repair:
+installation_root 在创建目录后调用 resolve()，把 Windows 重定向后的物理路径
+传给 Explorer、host.json、Run。已安装冻结程序优先从自身目录读取配置；
+下载副本在当前 LocalAppData 范围内复用已登记的安装目录。测试目录不采用
+另一个 LocalAppData 下的登记，避免测试改写真实安装。
+extension_directory 校验必要文件，缺失时从内嵌扩展补齐，返回实际物理目录。
+文件夹按钮复制这个路径，捕获 shell 错误；回归测试覆盖路径及异常。
+
+1.3 artwork pipeline (supersedes original 1.2 generator):
+artwork_source/horizon.js 来自当前网页 317638.68ee213e53.js 静态代码。
+它内含 Horizon 原始着色器和控制器，仅新增 OfflineRenderer getter 暴露既有
+绘制类 A。bake.html 提供同款 #3566f0 调色板，以及固定的监听等待状态参数。
+artwork_source/assets/watercolor.1a973cf03f.webp 为对应的原始水彩纹理。
+bake_web_orb.py 在独立本地 Edge / WebGL 环境运行，生成384帧RGBA，然后转为
+预乘BGRA动画。构建环境需要 playwright==1.64.1 和 Pillow==11.3.0；运行环境
+无需浏览器渲染引擎、Pillow或WebGL。bake时没有任何ChatGPT账号、Cookie或音频。
+16秒动画末尾18帧与首帧淡接，避免非周期原始运动直接重复产生跳变。
+现成 assets/orb.frames 已随源码打包，普通重建EXE无需重新生成。
+生成命令：python bake_web_orb.py
+来源与修改记录见 artwork_source/provenance.json。

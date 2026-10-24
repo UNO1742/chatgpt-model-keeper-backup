@@ -80,7 +80,7 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     $('#close').onclick=()=>request('hide');$('#save').onclick=()=>{closeMenus();const config={enabled:$('#enabled').checked};for(const mode of ['chat','work'])config[mode]={enabled:$('#'+mode+'-enabled').checked,model:$('#'+mode+'-model').value,effort:$('#'+mode+'-effort').dataset.effort};request('save',{config,startup:$('#startup').checked});};
     // One-click deploy: the shell signs a CRX and registers it with Edge, so no
     // developer mode is involved. The dialog below stays as a manual fallback.
-    $('#extension-action').onclick=()=>{closeMenus();if(extensionInstalled)request('uninstallExtension');else request('installExtension');notice(extensionInstalled?'正在移除浏览器扩展…':'正在部署浏览器扩展…');};
+    $('#extension-action').onclick=()=>{closeMenus();if(extensionInstalled)request('uninstallExtension');else request('installExtension');notice(extensionInstalled?'正在移除浏览器扩展…':'正在部署浏览器扩展，Edge 会自动重启…');};
     $('#guide-close').onclick=()=>{$('#guide').hidden=true;};
     $('#prepare-extension').onclick=()=>{request('prepareExtension');$('#guide-state').textContent='正在准备扩展并打开 Edge…';};
     $('#copy-path').onclick=()=>request('copyExtension');

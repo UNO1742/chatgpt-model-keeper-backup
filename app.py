@@ -16,7 +16,7 @@ import winreg
 import extension_deploy
 
 HOST = 'local.chatgpt.modelkeeper'
-VERSION = '2.3.0'
+VERSION = '2.4.0'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_VALUE = 'ChatGPTModelKeeper'
 def installation_root():
@@ -93,22 +93,27 @@ def extension_id():
 def extension_origins():
     return ['chrome-extension://'+value+'/' for value in extension_ids()]
 
-def deploy_extension():
-    # Registering the extension is best effort: when Edge or PowerShell refuses,
-    # the settings card still offers the manual developer-mode guide.
+def deploy_extension(restart=True):
+    # Registering the extension is best effort: when Edge refuses, the settings
+    # card still offers the manual developer-mode guide. Install and migration
+    # call it with restart=False so they never close a browser in use.
     try:
-        return extension_deploy.deploy(ROOT, extension_directory())
+        return extension_deploy.deploy(ROOT, extension_directory(), restart=restart)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        return {'installed': False, 'id': '', 'version': '', 'running': False, 'error': str(error)}
+        return {'installed': False, 'enabled': False, 'id': '', 'version': '', 'running': False, 'error': str(error)}
 
 def refresh_extension():
-    # Repack after an app update, but never resurrect an extension the user
-    # removed from Edge on purpose.
-    if not extension_deploy.registered(extension_id()):
-        return {'installed': False, 'id': extension_id(), 'version': '', 'running': False}
-    return deploy_extension()
+    # Re-apply after an app update, but never resurrect an extension the user
+    # removed on purpose.
+    if not extension_deploy.registered(ROOT):
+        return {'installed': False, 'enabled': False, 'id': extension_id(), 'version': '', 'running': False}
+    try:
+        return extension_deploy.refresh(ROOT, extension_directory())
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        return {'installed': False, 'enabled': False, 'id': '', 'version': '', 'running': False, 'error': str(error)}
 
 def startup_enabled():
+    """Is the current EXE the one Windows launches at login?"""
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             value, _ = winreg.QueryValueEx(key, RUN_VALUE)
@@ -116,6 +121,17 @@ def startup_enabled():
             return bool(match and Path(match.group(1)).resolve()==EXE.resolve())
     except FileNotFoundError:
         return False
+
+def startup_preference():
+    """The user's stored choice: True/False, or None when never recorded."""
+    try:
+        data=json.loads((ROOT/'startup.json').read_text(encoding='utf-8'))
+    except (OSError,ValueError,AttributeError):
+        return None
+    if 'enabled' in data:
+        return bool(data['enabled'])
+    # Legacy files only carried {'configured': True}; those users asked for it.
+    return True if data.get('configured') else None
 
 def set_startup(enabled):
     if enabled:
@@ -129,19 +145,35 @@ def set_startup(enabled):
                 winreg.DeleteValue(key, RUN_VALUE)
         except FileNotFoundError:
             pass
-    atomic_write(ROOT/'startup.json', {'configured': True})
+    atomic_write(ROOT/'startup.json', {'configured': True, 'enabled': bool(enabled)})
+
+def reconcile_startup():
+    """Re-create a missing Run entry, or drop one the user turned off.
+
+    Without this a lost Run value stayed lost forever: the stored preference said
+    "nothing to do" and no screen offered to turn it back on.
+    """
+    wanted = startup_preference()
+    if wanted is None or not EXE.is_file():
+        return False
+    if wanted == startup_enabled():
+        return False
+    try:
+        set_startup(wanted)
+        return True
+    except (OSError, RuntimeError):
+        return False
 
 def install():
-    # First 1.1 installation/migration enables requested login startup.
-    # Later updates preserve an explicit opt-out.
-    first_startup_setup = not (ROOT / 'startup.json').exists()
-    was_startup_enabled = startup_enabled()
+    # A first installation enables login startup; later updates keep the stored
+    # choice instead of silently resetting it.
+    wanted = startup_preference()
     ROOT.mkdir(parents=True, exist_ok=True)
     if not getattr(sys, 'frozen', False): raise RuntimeError('请使用已打包的 EXE 安装。')
     if Path(sys.executable).resolve() != EXE.resolve():
         shutil.copy2(sys.executable, EXE)
     shutil.copytree(ASSETS / 'extension', ROOT / 'extension', dirs_exist_ok=True)
-    deploy_extension()
+    deploy_extension(restart=False)
     host_exe = ROOT/'ModelKeeperHost.exe'
     atomic_write(ROOT / 'host.json', {'name': HOST, 'description': 'ChatGPT Model Keeper',
         'path': str(host_exe if host_exe.exists() else EXE), 'type': 'stdio',
@@ -164,7 +196,7 @@ def install():
     subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
                    creationflags=0x08000000, check=True, timeout=20, capture_output=True)
     if not (ROOT / 'config.json').exists(): atomic_write(ROOT / 'config.json', DEFAULT)
-    set_startup(True if first_startup_setup else was_startup_enabled)
+    set_startup(True if wanted is None else wanted)
 
 def extension_directory():
     folder = ROOT/'extension'
@@ -256,11 +288,15 @@ def native_main():
 
 def gui():
     from desktop import run
+    # Login startup can disappear (cleaner tools, profile resets); repair it here
+    # so the toggle in the settings card always reflects reality.
+    reconcile_startup()
     run()
 
 def register_installed():
     global ROOT, EXE
     legacy = ROOT
+    inherited = startup_preference()
     was_enabled = startup_enabled() if (legacy/'startup.json').exists() else True
     ROOT = Path(sys.executable).resolve().parent
     EXE = ROOT/'ModelKeeper.exe'
@@ -269,13 +305,13 @@ def register_installed():
             shutil.copy2(legacy/name,ROOT/name)
     if not (ROOT/'config.json').exists():atomic_write(ROOT/'config.json',DEFAULT)
     shutil.copytree(ASSETS/'extension',ROOT/'extension',dirs_exist_ok=True)
-    deploy_extension()
+    deploy_extension(restart=False)
     atomic_write(ROOT/'host.json',{'name':HOST,'description':'ChatGPT Model Keeper',
         'path':str(ROOT/'ModelKeeperHost.exe'),'type':'stdio',
         'allowed_origins':extension_origins()})
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Edge\NativeMessagingHosts'+'\\'+HOST) as key:
         winreg.SetValueEx(key,'',0,winreg.REG_SZ,str(ROOT/'host.json'))
-    set_startup(was_enabled)
+    set_startup(was_enabled if inherited is None else inherited)
     try:winreg.DeleteKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Uninstall\ChatGPTModelKeeper')
     except FileNotFoundError:pass
 
