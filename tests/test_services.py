@@ -1,15 +1,14 @@
 import base64
 import copy
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
-import struct
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import zipfile
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import app
 import github_updates as updates
