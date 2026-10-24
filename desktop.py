@@ -23,6 +23,7 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import app as api
+import extension_deploy
 from runtime_cache import ensure_runtime
 import github_updates
 
@@ -78,6 +79,15 @@ class Bridge(QObject):
                 QApplication.clipboard().setText(str(folder))
                 self.send('extensionPrepared',path=str(folder))
                 self.send('notice',text='已准备扩展、复制路径并打开 Edge。首次仍需开启开发人员模式并加载文件夹。')
+            elif action=='installExtension':
+                self.send('notice',text='正在部署浏览器扩展…')
+                owner.worker('extension',api.deploy_extension)
+            elif action=='uninstallExtension':
+                self.send('notice',text='正在移除浏览器扩展…')
+                owner.worker('extension',lambda:extension_deploy.remove(api.ROOT))
+            elif action=='restartEdge':
+                self.send('notice',text='正在重启 Edge…')
+                owner.worker('edgeRestart',extension_deploy.restart_edge)
             elif action in ('copyExtension','openExtension'):
                 folder=api.extension_directory();QApplication.clipboard().setText(str(folder))
                 if action=='openExtension':QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
@@ -182,6 +192,7 @@ class Desktop(QObject):
         self.outside_timer=QTimer(self);self.outside_timer.timeout.connect(self.check_outside_click);self.outside_timer.start(25)
         self.timer=QTimer(self);self.timer.timeout.connect(self.status);self.timer.start(3000)
         self.worker('runtime',lambda:ensure_runtime(api.ROOT,api.ASSETS))
+        self.worker('extensionRefresh',api.refresh_extension)
         application.aboutToQuit.connect(self.shutdown)
         if smoke:
             self.smoke=Path(smoke);QTimer.singleShot(11000,self.smoke_result)
@@ -206,10 +217,23 @@ class Desktop(QObject):
         if kind=='runtime':self.runtime_event.set()
         if isinstance(value,dict) and 'error' in value:
             if kind=='runtime':self.runtime_error='实时球资源加载失败：'+value['error']
+            if kind=='extensionRefresh':self.bridge.send('extensionState',state={'installed':False});return
+            if kind=='extension':
+                self.bridge.send('updateError',text='扩展部署失败：'+value['error']+'（可在悬浮球右键菜单中手动安装）');return
             self.bridge.send('updateError',text=self.runtime_error if kind=='runtime' else value['error']);return
         if kind=='runtime':
             self.runtime_ready=True
             if self.orb_ready:self.bridge.send('runtimeReady')
+        elif kind=='extension':
+            self.bridge.send('extensionState',state=value)
+            if value.get('installed'):
+                self.bridge.send('notice',text='扩展已部署。重启 Edge 后自动启用。' if value.get('running') else '扩展已部署，下次启动 Edge 时自动启用。')
+            else:
+                self.bridge.send('notice',text='扩展注册已移除，重启 Edge 后生效。')
+        elif kind=='edgeRestart':
+            self.bridge.send('notice',text='Edge 已重启，扩展状态会在连接后自动刷新。')
+        elif kind=='extensionRefresh':
+            self.bridge.send('extensionState',state=value)
         elif kind=='release':self.release=value;self.bridge.send('release',release=value)
         elif kind=='installer':
             subprocess.Popen([str(value),'/SILENT','/CLOSEAPPLICATIONS'],creationflags=0x08000000)
@@ -227,7 +251,8 @@ class Desktop(QObject):
                 r=list(data['tabs'].values())[-1];text=f"{r['mode']} · {r['state']} · {r['detail']}"
         except (OSError,ValueError,KeyError,TypeError):pass
         if self.runtime_error:text=self.runtime_error
-        self.bridge.send('status',text=text,connected=connected)
+        installed=bool(extension_deploy.registered(api.extension_id()))
+        self.bridge.send('status',text=text,connected=connected,extension=installed)
     def toggle_panel(self):
         if self.panel.isVisible():self.panel.hide();return
         area=self.application.primaryScreen().availableGeometry();x=self.orb.x()-280;y=self.orb.y()-655
@@ -238,8 +263,14 @@ class Desktop(QObject):
         light=api.load_appearance()['theme']=='light'
         menu=QMenu();menu.setStyleSheet('QMenu{background:'+('#fff;color:#171717' if light else '#202020;color:#eee')+';border:1px solid #777;border-radius:10px;padding:7px} QMenu::item{padding:8px 15px} QMenu::item:selected{background:'+('#e9e9e9' if light else '#3a3a3a')+'}')
         menu.addAction('模型设置',self.toggle_panel)
+        menu.addAction('重启 Edge（使扩展生效）',lambda:self.worker('edgeRestart',extension_deploy.restart_edge))
+        menu.addAction('手动安装扩展…',self.manual_extension)
         menu.addAction('项目与下载 · GitHub',lambda:QDesktopServices.openUrl(QUrl(github_updates.RELEASES)))
         menu.addSeparator();menu.addAction('退出悬浮窗',self.application.quit);menu.exec(QCursor.pos())
+    def manual_extension(self):
+        # Developer-mode fallback, only needed when automatic registration fails.
+        if not self.panel.isVisible():self.toggle_panel()
+        QTimer.singleShot(600,lambda:self.bridge.send('showGuide'))
     def smoke_result(self):
         self.toggle_panel()
         def finish(result):

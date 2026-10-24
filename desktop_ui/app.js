@@ -47,8 +47,10 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     const m=JSON.parse(raw);
     if(m.type==='initial'&&!isOrb){fill(m);notice(m.status||'已准备就绪');}
     if(m.type==='theme'&&!isOrb)setTheme(m.theme);
-    if(m.type==='status'&&!isOrb){notice(m.text);setExtensionInstalled(!!m.connected);}
+    if(m.type==='status'&&!isOrb){notice(m.text);if(typeof m.extension==='boolean')setExtensionInstalled(m.extension);}
+    if(m.type==='extensionState'&&!isOrb)setExtensionInstalled(!!m.state?.installed);
     if(m.type==='extensionPrepared'&&!isOrb)$('#guide-state').textContent='路径已复制：'+m.path+'。在文件夹选择框中粘贴并确认。';
+    if(m.type==='showGuide'&&!isOrb){$('#guide').hidden=false;$('#prepare-extension').focus();}
     if(m.type==='notice')notice(m.text);
     if(m.type==='release'&&!isOrb){release=m.release;$('#update').disabled=false;$('#update-label').textContent=release.newer?'安装更新 '+release.tag:'已是最新版 · '+release.tag;notice(release.newer?'更新来自 GitHub Releases，下载后将校验 SHA-256。':'当前已是 GitHub 最新稳定版。');}
     if(m.type==='updateError'&&!isOrb){$('#update').disabled=false;notice(m.text);}
@@ -76,10 +78,13 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     }
     document.addEventListener('pointerdown',e=>{if(!e.target.closest('.model-field'))closeMenus();});
     $('#close').onclick=()=>request('hide');$('#save').onclick=()=>{closeMenus();const config={enabled:$('#enabled').checked};for(const mode of ['chat','work'])config[mode]={enabled:$('#'+mode+'-enabled').checked,model:$('#'+mode+'-model').value,effort:$('#'+mode+'-effort').dataset.effort};request('save',{config,startup:$('#startup').checked});};
-    // The install / uninstall action is intentionally inert in this build. The
-    // guide dialog markup and the prepareExtension bridge stay available so the
-    // flow can be wired to this button later without redesigning the card.
-    $('#extension-action').onclick=()=>{closeMenus();renderExtensionAction();};
+    // One-click deploy: the shell signs a CRX and registers it with Edge, so no
+    // developer mode is involved. The dialog below stays as a manual fallback.
+    $('#extension-action').onclick=()=>{closeMenus();if(extensionInstalled)request('uninstallExtension');else request('installExtension');notice(extensionInstalled?'正在移除浏览器扩展…':'正在部署浏览器扩展…');};
+    $('#guide-close').onclick=()=>{$('#guide').hidden=true;};
+    $('#prepare-extension').onclick=()=>{request('prepareExtension');$('#guide-state').textContent='正在准备扩展并打开 Edge…';};
+    $('#copy-path').onclick=()=>request('copyExtension');
+    $('#open-folder').onclick=()=>request('openExtension');
     renderExtensionAction();
     $('#update').onclick=()=>{if(release?.newer){$('#update').disabled=true;request('installUpdate');}else{$('#update').disabled=true;request('checkUpdate');notice('正在查询 GitHub Releases…');}};
     document.addEventListener('focusin',e=>{if(!e.target.closest('.model-field'))closeMenus();});

@@ -24,3 +24,6 @@ tests/test_floating.py
 tests/test_packaged.py
 *.zip
 *.exe
+*.crx
+*.pem
+extension_key.json

@@ -29,4 +29,16 @@ placement, blue accent variables, allowed option data, accessibility bindings
 and local preset events are supplied by this project.
 
 The Edge extension manifest contains a public key solely to keep its identifier
-stable. No corresponding private key or account credential is included.
+stable. No signing private key ships with the repository or the installer: the
+key used for one-click deployment is generated locally on each machine (see
+Extension packaging below). No account credential is included.
+
+## Extension packaging
+
+`extension_deploy.py` writes the CRX3 container described by Chromium's
+`crx_file` format (magic `Cr24`, version 3, protobuf `CrxFileHeader` with
+`sha256_with_rsa`) and signs it with an RSA-2048 key minted per machine on first
+deployment. The key pair stays in the local install directory; only the public
+half reaches the extension manifest. Packaging is written in-tree with the
+standard library, so the frozen build carries no extra crypto stack. The PyPI
+package `crx3` (MIT) implements the same format if a reference is needed.

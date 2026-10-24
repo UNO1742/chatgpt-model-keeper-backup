@@ -120,11 +120,17 @@ def run():
             action=page.locator('#extension-action')
             assert action.text_content()=='安装' and action.get_attribute('data-state')=='idle'
             action.click();page.wait_for_timeout(60)
-            assert page.locator('#guide').is_hidden()
-            assert not page.evaluate('requests.some(x=>["prepareExtension","copyExtension","openExtension"].includes(x.action))')
-            page.evaluate('incoming(JSON.stringify({type:"status",connected:true,text:"等待 Edge 扩展连接。"}))')
+            assert page.evaluate('requests.some(x=>x.action==="installExtension")')
+            page.evaluate('incoming(JSON.stringify({type:"extensionState",state:{installed:true,id:"probe",version:"2.1.0",running:true}}))')
             assert action.text_content()=='卸载' and action.get_attribute('data-state')=='installed'
-            print('PASS no slider hint line, 浏览器扩展 row with inert 安装 placeholder and reserved 卸载 state')
+            action.click();page.wait_for_timeout(60)
+            assert page.evaluate('requests.some(x=>x.action==="uninstallExtension")')
+            page.evaluate('incoming(JSON.stringify({type:"extensionState",state:{installed:false,id:"probe",version:"",running:true}}))')
+            assert action.text_content()=='安装' and action.get_attribute('data-state')=='idle'
+            page.evaluate('incoming(JSON.stringify({type:"showGuide"}))')
+            assert page.locator('#guide').is_visible()
+            page.locator('#guide-close').click();assert page.locator('#guide').is_hidden()
+            print('PASS one-click extension deploy: install/uninstall requests, installed state flip, manual guide fallback')
             page.evaluate('incoming(JSON.stringify({type:"release",release:{newer:true,tag:"v2.2.0"}}));incoming(JSON.stringify(initial));')
             assert page.locator('#version').text_content()=='v'+app.VERSION
             page.locator('#update').click();assert page.evaluate('requests.some(x=>x.action==="installUpdate")')

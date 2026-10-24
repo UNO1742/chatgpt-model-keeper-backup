@@ -1,7 +1,6 @@
 """ChatGPT Model Keeper: per-user installer, settings UI and native messaging host."""
 import copy
 import ctypes
-import hashlib
 import json
 import os
 import re
@@ -13,6 +12,8 @@ import sys
 import tempfile
 import time
 import winreg
+
+import extension_deploy
 
 HOST = 'local.chatgpt.modelkeeper'
 VERSION = '2.2.1'
@@ -78,11 +79,34 @@ def load_config():
     except (OSError, ValueError, TypeError, AttributeError): pass
     return result
 
+def extension_ids():
+    # The installed copy carries this machine's signing key, so it owns the live
+    # ID; the bundled key stays listed for extensions that were loaded by hand
+    # before one-click deployment existed.
+    values = [extension_deploy.folder_id(ROOT/'extension'), extension_deploy.folder_id(ASSETS/'extension')]
+    return [value for value in dict.fromkeys(values) if value]
+
 def extension_id():
-    import base64
-    key = json.loads((ASSETS / 'extension' / 'manifest.json').read_text(encoding='utf-8'))['key']
-    digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
-    return ''.join(chr(ord('a') + int(c, 16)) for c in digest)
+    values = extension_ids()
+    return values[0] if values else ''
+
+def extension_origins():
+    return ['chrome-extension://'+value+'/' for value in extension_ids()]
+
+def deploy_extension():
+    # Registering the extension is best effort: when Edge or PowerShell refuses,
+    # the settings card still offers the manual developer-mode guide.
+    try:
+        return extension_deploy.deploy(ROOT, extension_directory())
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        return {'installed': False, 'id': '', 'version': '', 'running': False, 'error': str(error)}
+
+def refresh_extension():
+    # Repack after an app update, but never resurrect an extension the user
+    # removed from Edge on purpose.
+    if not extension_deploy.registered(extension_id()):
+        return {'installed': False, 'id': extension_id(), 'version': '', 'running': False}
+    return deploy_extension()
 
 def startup_enabled():
     try:
@@ -117,10 +141,11 @@ def install():
     if Path(sys.executable).resolve() != EXE.resolve():
         shutil.copy2(sys.executable, EXE)
     shutil.copytree(ASSETS / 'extension', ROOT / 'extension', dirs_exist_ok=True)
+    deploy_extension()
     host_exe = ROOT/'ModelKeeperHost.exe'
     atomic_write(ROOT / 'host.json', {'name': HOST, 'description': 'ChatGPT Model Keeper',
         'path': str(host_exe if host_exe.exists() else EXE), 'type': 'stdio',
-        'allowed_origins': ['chrome-extension://' + extension_id() + '/']})
+        'allowed_origins': extension_origins()})
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
         r'Software\Microsoft\Edge\NativeMessagingHosts' + '\\' + HOST) as key:
         winreg.SetValueEx(key, '', 0, winreg.REG_SZ, str(ROOT / 'host.json'))
@@ -169,6 +194,8 @@ def prepare_extension_install():
 def uninstall():
     set_startup(False)
     # Browser must remove its own extension; preserve preferences for reinstall.
+    try: extension_deploy.remove(ROOT)
+    except (OSError, RuntimeError, ValueError): pass
     for sub in (r'Software\Microsoft\Edge\NativeMessagingHosts' + '\\' + HOST,
                 r'Software\Microsoft\Windows\CurrentVersion\Uninstall\ChatGPTModelKeeper'):
         try: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
@@ -242,9 +269,10 @@ def register_installed():
             shutil.copy2(legacy/name,ROOT/name)
     if not (ROOT/'config.json').exists():atomic_write(ROOT/'config.json',DEFAULT)
     shutil.copytree(ASSETS/'extension',ROOT/'extension',dirs_exist_ok=True)
+    deploy_extension()
     atomic_write(ROOT/'host.json',{'name':HOST,'description':'ChatGPT Model Keeper',
         'path':str(ROOT/'ModelKeeperHost.exe'),'type':'stdio',
-        'allowed_origins':['chrome-extension://'+extension_id()+'/']})
+        'allowed_origins':extension_origins()})
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Edge\NativeMessagingHosts'+'\\'+HOST) as key:
         winreg.SetValueEx(key,'',0,winreg.REG_SZ,str(ROOT/'host.json'))
     set_startup(was_enabled)
@@ -266,6 +294,13 @@ def main():
         return 0
     if '--install' in sys.argv:
         install()
+        return 0
+    if '--install-extension' in sys.argv:
+        result = deploy_extension()
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get('installed') else 1
+    if '--uninstall-extension' in sys.argv:
+        print(json.dumps(extension_deploy.remove(ROOT), ensure_ascii=False))
         return 0
     if '--selftest' in sys.argv:
         return 0 if all(k in load_config() for k in ('chat','work')) and len(extension_id())==32 else 2
