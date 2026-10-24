@@ -113,13 +113,18 @@ def run():
             page.evaluate('incoming(JSON.stringify({...initial,theme:"light"}))')
             assert page.locator('#theme-light').get_attribute('aria-pressed')=='true'
             print('PASS monochrome day/night themes, immediate persistence request and restored appearance')
-            page.locator('#extension').click();assert page.locator('#guide').is_visible()
-            page.locator('#prepare-extension').click();assert page.evaluate('requests.some(x=>x.action==="prepareExtension")')
-            page.evaluate('incoming(JSON.stringify({type:"status",connected:true,text:"已连接"}))')
-            assert '已连接成功' in page.locator('#guide-state').inner_text()
-            page.locator('#open-folder').click();assert page.evaluate('requests.some(x=>x.action==="openExtension")')
-            page.locator('#guide-close').click();assert not page.locator('#guide').is_visible()
-            print('PASS assisted extension installation: preparation action, manual confirmation guidance, automatic connection confirmation')
+            assert page.locator('.hint').count()==0
+            assert page.locator('#chat-effort').get_attribute('aria-describedby')is None
+            assert page.locator('#work-effort').get_attribute('aria-describedby')is None
+            assert page.locator('.action-row span').text_content()=='浏览器扩展'
+            action=page.locator('#extension-action')
+            assert action.text_content()=='安装' and action.get_attribute('data-state')=='idle'
+            action.click();page.wait_for_timeout(60)
+            assert page.locator('#guide').is_hidden()
+            assert not page.evaluate('requests.some(x=>["prepareExtension","copyExtension","openExtension"].includes(x.action))')
+            page.evaluate('incoming(JSON.stringify({type:"status",connected:true,text:"等待 Edge 扩展连接。"}))')
+            assert action.text_content()=='卸载' and action.get_attribute('data-state')=='installed'
+            print('PASS no slider hint line, 浏览器扩展 row with inert 安装 placeholder and reserved 卸载 state')
             page.evaluate('incoming(JSON.stringify({type:"release",release:{newer:true,tag:"v2.2.0"}}));incoming(JSON.stringify(initial));')
             assert page.locator('#version').text_content()=='v'+app.VERSION
             page.locator('#update').click();assert page.evaluate('requests.some(x=>x.action==="installUpdate")')

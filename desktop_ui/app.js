@@ -7,6 +7,12 @@ const sliderInstances={},sliderLoads={};
 function notice(s){if(!isOrb)$('#status').textContent=s;}
 function request(action,data){bridge.request(JSON.stringify({action,data}));}
 function setTheme(theme){document.documentElement.dataset.theme=theme;for(const t of ['light','dark'])$('#theme-'+t).setAttribute('aria-pressed',String(t===theme));}
+// Extension row keeps a placeholder action button. Wiring the real install flow is
+// reserved for a later release; installed state only flips the label to "卸载".
+let extensionInstalled=false;
+function renderExtensionAction(){const button=$('#extension-action');if(!button)return;const label=extensionInstalled?'卸载':'安装';button.textContent=label;button.dataset.state=extensionInstalled?'installed':'idle';button.setAttribute('aria-label',label+'浏览器扩展');}
+function setExtensionInstalled(value){extensionInstalled=!!value;renderExtensionAction();}
+window.setExtensionInstalled=setExtensionInstalled;
 function closeMenus(){for(const mode of ['chat','work']){$('#'+mode+'-model-menu').hidden=true;$('#'+mode+'-model').setAttribute('aria-expanded','false');}}
 function selectedModel(mode,value){const trigger=$('#'+mode+'-model');trigger.value=value;$('#'+mode+'-model-value').textContent=value;for(const option of $('#'+mode+'-model-menu').children){const selected=option.value===value;option.setAttribute('aria-selected',String(selected));option.querySelector('.check').textContent=selected?'✓':'';}}
 function buildModels(mode,value){const menu=$('#'+mode+'-model-menu');const entries=[...models[mode]];if(value&&!entries.includes(value))entries.unshift(value);menu.replaceChildren(...entries.map(name=>{const option=document.createElement('button');option.type='button';option.className='model-option no-drag itemBase-Uk8vyp rounded-xl text-default group itemInteractive-A3p9wI flex flex-col';option.setAttribute('role','option');option.value=name;option.tabIndex=-1;const row=document.createElement('div');row.dataset.menuRowContent='true';row.className='flex w-full min-w-0 items-center gap-1.5';const label=document.createElement('span');label.className='flex-1 min-w-0 truncate';label.textContent=name;const check=document.createElement('span');check.className='check';check.setAttribute('aria-hidden','true');row.append(label,check);option.append(row);option.onclick=()=>{selectedModel(mode,name);closeMenus();$('#'+mode+'-model').focus();};return option;}));selectedModel(mode,value);}
@@ -41,7 +47,7 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     const m=JSON.parse(raw);
     if(m.type==='initial'&&!isOrb){fill(m);notice(m.status||'已准备就绪');}
     if(m.type==='theme'&&!isOrb)setTheme(m.theme);
-    if(m.type==='status'&&!isOrb){notice(m.text);$('#extension-badge').textContent=m.connected?'已连接':'未连接';$('#extension-badge').classList.toggle('connected',m.connected);if(m.connected){$('#guide-state').textContent='已连接成功。首次安装已完成，无需再次加载。';$('#prepare-extension').textContent='已连接 · 打开扩展管理';}}
+    if(m.type==='status'&&!isOrb){notice(m.text);setExtensionInstalled(!!m.connected);}
     if(m.type==='extensionPrepared'&&!isOrb)$('#guide-state').textContent='路径已复制：'+m.path+'。在文件夹选择框中粘贴并确认。';
     if(m.type==='notice')notice(m.text);
     if(m.type==='release'&&!isOrb){release=m.release;$('#update').disabled=false;$('#update-label').textContent=release.newer?'安装更新 '+release.tag:'已是最新版 · '+release.tag;notice(release.newer?'更新来自 GitHub Releases，下载后将校验 SHA-256。':'当前已是 GitHub 最新稳定版。');}
@@ -70,7 +76,11 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     }
     document.addEventListener('pointerdown',e=>{if(!e.target.closest('.model-field'))closeMenus();});
     $('#close').onclick=()=>request('hide');$('#save').onclick=()=>{closeMenus();const config={enabled:$('#enabled').checked};for(const mode of ['chat','work'])config[mode]={enabled:$('#'+mode+'-enabled').checked,model:$('#'+mode+'-model').value,effort:$('#'+mode+'-effort').dataset.effort};request('save',{config,startup:$('#startup').checked});};
-    $('#extension').onclick=()=>{closeMenus();$('#guide').hidden=false;$('#prepare-extension').focus();};$('#guide-close').onclick=()=>{$('#guide').hidden=true;$('#extension').focus();};$('#prepare-extension').onclick=()=>{request('prepareExtension');$('#guide-state').textContent='正在准备扩展并打开 Edge…';};$('#copy-path').onclick=()=>request('copyExtension');$('#open-folder').onclick=()=>request('openExtension');
+    // The install / uninstall action is intentionally inert in this build. The
+    // guide dialog markup and the prepareExtension bridge stay available so the
+    // flow can be wired to this button later without redesigning the card.
+    $('#extension-action').onclick=()=>{closeMenus();renderExtensionAction();};
+    renderExtensionAction();
     $('#update').onclick=()=>{if(release?.newer){$('#update').disabled=true;request('installUpdate');}else{$('#update').disabled=true;request('checkUpdate');notice('正在查询 GitHub Releases…');}};
     document.addEventListener('focusin',e=>{if(!e.target.closest('.model-field'))closeMenus();});
     document.onkeydown=e=>{if(e.key==='Escape'){if(!$('#guide').hidden){$('#guide-close').click();return;}if(document.querySelector('.model-menu:not([hidden])')){closeMenus();return;}request('hide');}if(e.key==='Tab'&&!$('#guide').hidden){const buttons=[...$('#guide').querySelectorAll('button:not([disabled])')],index=buttons.indexOf(document.activeElement);if(e.shiftKey&&index<=0){e.preventDefault();buttons.at(-1).focus();}else if(!e.shiftKey&&(index===buttons.length-1||index<0)){e.preventDefault();buttons[0].focus();}}};

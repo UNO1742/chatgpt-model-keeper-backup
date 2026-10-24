@@ -219,7 +219,7 @@ class Desktop(QObject):
             models=api.MODELS,efforts=api.MODE_EFFORTS,theme=api.load_appearance()['theme'],status=self.runtime_error or '原始网页动效 · 实时 WebGL 渲染')
     def status(self):
         if not self.panel_ready or not self.panel.isVisible():return
-        connected=False;text='等待 Edge 扩展连接。首次使用请点击“浏览器扩展安装”。'
+        connected=False;text='等待 Edge 扩展连接。'
         try:
             data=json.loads((api.ROOT/'status.json').read_text(encoding='utf-8'))
             connected=time.time()-data['updated']<20 and bool(data['tabs'])

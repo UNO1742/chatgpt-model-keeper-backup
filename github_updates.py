@@ -6,7 +6,7 @@ import re
 import urllib.request
 from urllib.parse import urlparse
 
-REPO='UNO1742/chatgpt-model-keeper'
+REPO='UNO1742/chatgpt-model-keeper-backup'
 RELEASES=f'https://github.com/{REPO}/releases'
 ASSET='ModelKeeper-Setup.exe'
 
