@@ -3,8 +3,8 @@ const view=new URLSearchParams(location.search).get('view')||'settings';
 const isOrb=view==='orb',isPanel=view==='settings',isToast=view==='toast';
 const $=s=>document.querySelector(s);
 $('#orb').hidden=!isOrb;$('#card').hidden=!isPanel;$('#toast').hidden=!isToast;
+const sliderInstances={},sliderLoads={},mountedStops={};
 let bridge,release=null,models={chat:[],work:[]},efforts={chat:[],work:[]},orbLoading=false;
-const sliderInstances={},sliderLoads={};
 function notice(s){if(isPanel)$('#status').textContent=s;}
 function request(action,data){bridge.request(JSON.stringify({action,data}));}
 function setTheme(theme){document.documentElement.dataset.theme=theme;for(const t of ['light','dark'])$('#theme-'+t).setAttribute('aria-pressed',String(t===theme));}
@@ -18,10 +18,50 @@ function closeMenus(){for(const mode of ['chat','work']){$('#'+mode+'-model-menu
 function selectedModel(mode,value){const trigger=$('#'+mode+'-model');trigger.value=value;$('#'+mode+'-model-value').textContent=value;for(const option of $('#'+mode+'-model-menu').children){const selected=option.value===value;option.setAttribute('aria-selected',String(selected));option.querySelector('.check').textContent=selected?'✓':'';}}
 function buildModels(mode,value){const menu=$('#'+mode+'-model-menu');const entries=[...models[mode]];if(value&&!entries.includes(value))entries.unshift(value);menu.replaceChildren(...entries.map(name=>{const option=document.createElement('button');option.type='button';option.className='model-option no-drag itemBase-Uk8vyp rounded-xl text-default group itemInteractive-A3p9wI flex flex-col';option.setAttribute('role','option');option.value=name;option.tabIndex=-1;const row=document.createElement('div');row.dataset.menuRowContent='true';row.className='flex w-full min-w-0 items-center gap-1.5';const label=document.createElement('span');label.className='flex-1 min-w-0 truncate';label.textContent=name;const check=document.createElement('span');check.className='check';check.setAttribute('aria-hidden','true');row.append(label,check);option.append(row);option.onclick=()=>{selectedModel(mode,name);closeMenus();$('#'+mode+'-model').focus();};return option;}));selectedModel(mode,value);}
 function openMenu(mode,keyboard=false){const trigger=$('#'+mode+'-model'),menu=$('#'+mode+'-model-menu');const wasOpen=!menu.hidden;closeMenus();if(wasOpen)return;trigger.setAttribute('aria-expanded','true');menu.hidden=false;if(keyboard)(menu.querySelector('[aria-selected=true]')||menu.firstElementChild)?.focus();}
-function renderEffort(mode,value){const slider=$('#'+mode+'-effort'),items=efforts[mode];let index=items.findIndex(item=>item[0]===value);if(index<0)index=items.length-1;const [id,label]=items[index];slider.dataset.effort=id;slider.setAttribute('aria-valuemin','0');slider.setAttribute('aria-valuemax',String(items.length-1));slider.setAttribute('aria-valuenow',String(index));slider.setAttribute('aria-valuetext',label);$('#'+mode+'-effort-label').textContent=label;$('#'+mode+'-rail-labels').querySelectorAll('button').forEach((b,i)=>b.setAttribute('aria-pressed',String(i===index)));}
+const EFFORT_ORDER=['none','low','medium','high','xhigh','max','ultra'];
+// When the page does not offer the saved level, show the closest one it does
+// offer instead of jumping to the top of the range.
+function nearestEffort(items,value){const want=EFFORT_ORDER.indexOf(value);if(want<0)return items.length-1;let best=items.length-1,gap=Infinity;items.forEach((item,index)=>{const offset=Math.abs(EFFORT_ORDER.indexOf(item[0])-want);if(offset<gap){gap=offset;best=index;}});return best;}
+function renderEffort(mode,value){const slider=$('#'+mode+'-effort'),items=efforts[mode];if(!items.length)return;const index=nearestEffort(items,value);const [id,label]=items[index];slider.dataset.effort=id;slider.setAttribute('aria-valuemin','0');slider.setAttribute('aria-valuemax',String(items.length-1));slider.setAttribute('aria-valuenow',String(index));slider.setAttribute('aria-valuetext',label);$('#'+mode+'-rail-labels').querySelectorAll('button').forEach((b,i)=>b.setAttribute('aria-pressed',String(i===index)));}
 async function selectEffort(mode,value){renderEffort(mode,value);const instance=sliderInstances[mode]||await sliderLoads[mode];if(instance)instance.select(value);}
-function buildEfforts(mode,value){const items=efforts[mode],slider=$('#'+mode+'-effort');$('#'+mode+'-rail-labels').replaceChildren(...items.map(([id,label])=>{const button=document.createElement('button');button.textContent=label.split(' / ')[0];button.title=label;button.onclick=()=>{selectEffort(mode,id);slider.focus();};return button;}));renderEffort(mode,value);if(sliderInstances[mode]){sliderInstances[mode].select(slider.dataset.effort);return;}if(!sliderLoads[mode])sliderLoads[mode]=originalSlider.mount(slider,{options:items,selected:slider.dataset.effort,onChange:id=>renderEffort(mode,id)}).then(instance=>{sliderInstances[mode]=instance;instance.select(slider.dataset.effort);return instance;}).catch(error=>{notice('原始滑条加载失败：'+error.message);throw error;});}
-let listsKey='';
+function buildEfforts(mode,value){const items=efforts[mode],slider=$('#'+mode+'-effort');$('#'+mode+'-rail-labels').replaceChildren(...items.map(([id,label])=>{const button=document.createElement('button');button.textContent=label.split(' / ')[0];button.title=label;button.onclick=()=>{selectEffort(mode,id);slider.focus();};return button;}));renderEffort(mode,value);const stops=items.map(item=>item[0]).join(',');
+  // The page can report a shorter range than the built-in one, so the mounted
+  // slider is only reused when it has the same number of stops.
+  if(sliderInstances[mode]&&mountedStops[mode]===stops){sliderInstances[mode].select(slider.dataset.effort);return;}
+  if(sliderInstances[mode]){try{sliderInstances[mode].dispose();}catch{}delete sliderInstances[mode];delete sliderLoads[mode];}
+  mountedStops[mode]=stops;
+  sliderLoads[mode]=originalSlider.mount(slider,{options:items,selected:slider.dataset.effort,onChange:id=>renderEffort(mode,id)}).then(instance=>{sliderInstances[mode]=instance;instance.select(slider.dataset.effort);return instance;}).catch(error=>{notice('原始滑条加载失败：'+error.message);throw error;});}
+let listsKey='',baseModels={chat:[],work:[]},baseEfforts={chat:[],work:[]},pageLists={},effortLabels={},currentConfig=null;
+function learnLabels(source){for(const mode of ['chat','work'])for(const pair of (source?.[mode]||[]))effortLabels[pair[0]]=pair;}
+// The card copies the page: when the extension reported the real model list and
+// thinking levels, those win over the built-in fallback. Levels are only taken
+// over for the model they were measured on.
+function resolveLists(config){
+  const result={models:{chat:[],work:[]},efforts:{chat:[],work:[]}};
+  for(const mode of ['chat','work']){
+    const page=pageLists[mode],chosen=config?.[mode]?.model||'';
+    const names=page?.models?.length?page.models.slice():baseModels[mode].slice();
+    let stops=page?.efforts?.length&&(!page.model||page.model===chosen)?page.efforts.slice():baseEfforts[mode].map(item=>item[0]);
+    stops=stops.filter(id=>effortLabels[id]);
+    if(stops.length<2)stops=baseEfforts[mode].map(item=>item[0]);
+    result.models[mode]=names;result.efforts[mode]=stops.map(id=>effortLabels[id]);
+  }
+  return result;
+}
+function renderLists(){
+  const lists=resolveLists(currentConfig);
+  listsKey=JSON.stringify([lists,currentConfig?.chat?.model,currentConfig?.work?.model]);
+  models=lists.models;efforts=lists.efforts;
+  for(const mode of ['chat','work']){const p=currentConfig?.[mode];if(!p)continue;$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}
+}
+function applyLists(lists){
+  pageLists=lists||{};
+  if(!currentConfig)return;
+  const next=resolveLists(currentConfig);
+  const key=JSON.stringify([next,currentConfig.chat.model,currentConfig.work.model]);
+  if(key===listsKey)return;
+  renderLists();
+}
 function fill(data){
   // Reopening the card must not rebuild identical model lists or remount the
   // slider: that is what made the panel blink once on every open. Structural
@@ -29,9 +69,15 @@ function fill(data){
   // plain values are re-applied silently (no visual change when already equal).
   setTheme(data.theme||'dark');
   $('#version').textContent='v'+data.version;$('#enabled').checked=data.config.enabled;$('#startup').checked=data.startup;
-  const key=JSON.stringify([data.version,data.models,data.efforts,data.config.chat.model,data.config.work.model]);
+  currentConfig=data.config;
+  if(data.models)baseModels=data.models;
+  if(data.efforts)baseEfforts=data.efforts;
+  if(data.lists)pageLists=data.lists;
+  learnLabels(baseEfforts);
+  const lists=resolveLists(currentConfig);
+  const key=JSON.stringify([data.version,lists,data.config.chat.model,data.config.work.model]);
   if(key!==listsKey){
-    listsKey=key;models=data.models;efforts=data.efforts;
+    listsKey=key;models=lists.models;efforts=lists.efforts;
     for(const mode of ['chat','work']){const p=data.config[mode];$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}
     return;
   }
@@ -90,14 +136,22 @@ function panelExit(){
 }
 function showToast(m){
   const root=$('#toast'),bubble=root.querySelector('.bubble');
+  if(m.theme)setTheme(m.theme);
   root.classList.toggle('up',!!m.above);
   root.style.setProperty('--tail',(m.tail||156)+'px');
-  $('#toast-title').textContent=m.title||'已切回预设';
-  $('#toast-detail').textContent=m.detail||'';
+  $('#toast-model').textContent=m.model||'目标模型';
+  const previous=(m.previous||'').trim();
+  $('#toast-sub-lead').hidden=!previous;
+  $('#toast-previous').hidden=!previous;
+  $('#toast-previous').textContent=previous;
+  $('#toast-sub-tail').textContent=previous?'':'网页的模型与预设不一致，已自动恢复';
   if(toastAnim)toastAnim.cancel();
   clearTimeout(toastTimer);
-  const from=m.above?-10:10;
-  toastAnim=bubble.animate([{opacity:0,transform:`translateY(${from}px) scale(.94)`},{opacity:1,transform:'none'}],{duration:460,easing:'cubic-bezier(.2,.9,.25,1)',fill:'both'});
+  // Grow out of the tail, which always points at the ball.
+  bubble.style.transformOrigin=(m.tail||156)+'px '+(m.above?'100%':'0');
+  const from=m.above?-12:12;
+  root.classList.remove('in');void root.offsetWidth;root.classList.add('in');
+  toastAnim=bubble.animate([{opacity:0,transform:`translateY(${from}px) scale(.94)`},{opacity:1,offset:.55},{opacity:1,transform:'none'}],{duration:460,easing:'cubic-bezier(.16,1,.3,1)',fill:'both'});
   toastAnim.onfinish=()=>{bubble.style.opacity='1';bubble.style.transform='none';};
   setTimeout(()=>{if(bubble.style.opacity!=='1'){if(toastAnim)toastAnim.cancel();bubble.style.opacity='1';bubble.style.transform='none';}},600);
   scheduleToastHide();
@@ -106,7 +160,8 @@ function scheduleToastHide(){clearTimeout(toastTimer);if(toastHover)return;toast
 function hideToast(){
   const bubble=$('#toast .bubble');
   if(toastAnim)toastAnim.cancel();
-  toastAnim=bubble.animate([{opacity:1,transform:'none'},{opacity:0,transform:'translateY(-6px) scale(.97)'}],{duration:180,easing:'cubic-bezier(.4,0,1,1)',fill:'both'});
+  $('#toast').classList.remove('in');
+  toastAnim=bubble.animate([{opacity:1,transform:'none'},{opacity:0,transform:'translateY(6px) scale(.982)'}],{duration:240,easing:'ease',fill:'both'});
   toastAnim.onfinish=()=>{toastAnim=null;bubble.style.opacity='';bubble.style.transform='';request('toastDone');};
 }
 new QWebChannel(qt.webChannelTransport,channel=>{
@@ -114,7 +169,8 @@ new QWebChannel(qt.webChannelTransport,channel=>{
   bridge.message.connect(raw=>{
     const m=JSON.parse(raw);
     if(m.type==='initial'&&isPanel){fill(m);notice(m.status||'已准备就绪');}
-    if(m.type==='theme'&&isPanel)setTheme(m.theme);
+    if(m.type==='theme')setTheme(m.theme);
+    if(m.type==='lists'&&isPanel)applyLists(m.lists);
     if(m.type==='status'&&isPanel){notice(m.text);if(typeof m.extension==='boolean')setExtensionInstalled(m.extension);}
     if(m.type==='extensionState'&&isPanel)setExtensionInstalled(!!m.state?.installed);
     if(m.type==='extensionPrepared'&&isPanel)$('#guide-state').textContent='路径已复制：'+m.path+'。在文件夹选择框中粘贴并确认。';

@@ -46,6 +46,9 @@ class Bridge(QObject):
                     if owner.runtime_ready:self.send('runtimeReady')
                 elif view=='toast':
                     owner.toast_ready=True
+                    # The bubble has no settings of its own; it just follows the
+                    # appearance picked in the card.
+                    self.send('theme',theme=api.load_appearance()['theme'])
                 else:
                     owner.panel_ready=True;owner.initial();owner.status()
                     owner.push_enter()
@@ -180,6 +183,7 @@ class Desktop(QObject):
         self.runtime_ready=False;self.runtime_error='';self.orb_ready=False;self.panel_ready=False;self.runtime_event=threading.Event()
         self.panel_drag=None;self.mouse_buttons=0;self.guard_pending=False
         self.panel_closing=False;self.panel_enter=None;self.seen_corrections=None
+        self.page_lists={}
         self.console_errors=[];self.release=None;self.drag_start=None;self.token=secrets.token_urlsafe(24)
         manifest=json.loads((api.ASSETS/'runtime_manifest.json').read_text(encoding='utf-8'))
         self.runtime_files={'runtime/'+entry['path'] for entry in manifest['files']}
@@ -191,8 +195,10 @@ class Desktop(QObject):
         threading.Thread(target=self.server.serve_forever,daemon=True).start()
         self.orb=View(self,'orb',80,80);self.panel=View(self,'settings',384,674)
         # Third view: the correction bubble. Lazy-free (created once) so a toast
-        # never waits for a page load when a correction lands.
-        self.toast=View(self,'toast',328,126);self.toast_ready=False
+        # never waits for a page load when a correction lands. The window only
+        # holds the bubble plus a 10 px ring for its tail, so the shadow is
+        # never clipped into a dark rectangle.
+        self.toast=View(self,'toast',322,126);self.toast_ready=False
         # Limit hit area to the visible small orb, instead of a large transparent overlay.
         self.orb.setMask(QRegion(2,2,76,76,QRegion.RegionType.Ellipse))
         screen=application.primaryScreen().availableGeometry()
@@ -270,7 +276,8 @@ class Desktop(QObject):
             self.application.quit()
     def initial(self):
         self.bridge.send('initial',config=api.load_config(),startup=api.startup_enabled(),version=api.VERSION,
-            models=api.MODELS,efforts=api.MODE_EFFORTS,theme=api.load_appearance()['theme'],status=self.runtime_error or '原始网页动效 · 实时 WebGL 渲染')
+            models=api.MODELS,efforts=api.MODE_EFFORTS,lists=self.page_lists,
+            theme=api.load_appearance()['theme'],status=self.runtime_error or '原始网页动效 · 实时 WebGL 渲染')
     def status(self):
         connected=False;text='等待 Edge 扩展连接。';data=None
         try:
@@ -279,11 +286,25 @@ class Desktop(QObject):
             if connected:
                 r=list(data['tabs'].values())[-1];text=f"{r['mode']} · {r['state']} · {r['detail']}"
         except (OSError,ValueError,KeyError,TypeError):pass
-        if data:self.scan_corrections(data)
+        if data:
+            self.scan_lists(data);self.scan_corrections(data)
         if self.runtime_error:text=self.runtime_error
         if not self.panel_ready or not self.panel.isVisible():return
         state=extension_deploy.state(api.ROOT)
         self.bridge.send('status',text=text,connected=connected,extension=state['installed'],extensionEnabled=state['enabled'])
+    def scan_lists(self,data):
+        # Model names and thinking levels the page really offers, so the card
+        # stops guessing. Anything the host rejected stayed out already.
+        merged={}
+        for report in (data.get('tabs') or {}).values():
+            mode={'聊天':'chat','工作':'work'}.get(str(report.get('mode') or ''))
+            if not mode:continue
+            models=report.get('models') or [];efforts=report.get('efforts') or []
+            if not models and not efforts:continue
+            merged[mode]={'model':str(report.get('forModel') or ''),'models':models,'efforts':efforts}
+        if merged==self.page_lists:return
+        self.page_lists=merged
+        if self.panel_ready:self.bridge.send('lists',lists=merged)
     def scan_corrections(self,data):
         # The extension reports {changed, previous, applied, seq}; anything new
         # since the last sweep becomes a bubble under the ball. The first sweep
@@ -303,12 +324,14 @@ class Desktop(QObject):
     def show_toast(self,report):
         applied=str(report.get('applied') or '').strip()
         previous=str(report.get('previous') or '').strip()
-        detail=f'网页上原来是 {previous}，已自动纠正' if previous else '网页上的模型和预设不一致，已自动纠正'
         area=self.application.primaryScreen().availableGeometry()
         orb=self.orb.geometry();width=self.toast.width();height=self.toast.height()
+        inset=10  # transparent ring that holds the tail and the soft shadow
         cx=orb.x()+orb.width()//2
-        below=orb.y()+orb.height()+8
-        above=orb.y()-8-height
+        # The bubble, not the window, sits next to the ball: the window is placed
+        # so the 10 px ring is what ends up in the gap.
+        below=orb.y()+orb.height()
+        above=orb.y()-height
         # Prefer the bubble under the ball; flip above when the desk edge is
         # closer than the bubble is tall (the default spot is 65 px from the
         # bottom, so it usually flips).
@@ -317,13 +340,20 @@ class Desktop(QObject):
         x=max(area.left(),min(cx-width//2,area.right()-width+1))
         self.toast.move(QPoint(int(x),int(y)))
         self.toast.show();self.toast.raise_()
-        tail=max(24,min(int(cx-x-8),width-32))
-        title='已按预设切回 '+(applied or '目标模型')
-        # Give the freshly raised window one paint before the bubble animates in.
-        QTimer.singleShot(30,lambda:self.bridge.send('toast',title=title,detail=detail,above=high,tail=tail))
+        inner=width-2*inset
+        tail=max(26,min(int(cx-x-inset),inner-26))
+        # Give the freshly raised window one paint before the bubble animates in,
+        # and wait for its page if it is still loading: a message sent before the
+        # bridge exists would leave an empty window behind.
+        payload={'model':applied or '目标模型','previous':previous,'above':high,'tail':tail}
+        QTimer.singleShot(30,lambda:self.push_toast(payload))
         # The page normally reports back after its 5.2 s dwell; this bounds the
         # bubble even if that message is lost.
         QTimer.singleShot(9000,self.toast.hide)
+    def push_toast(self,payload,tries=10):
+        if self.toast_ready or tries<=0:
+            self.bridge.send('toast',**payload);return
+        QTimer.singleShot(120,lambda:self.push_toast(payload,tries-1))
     def panel_placement(self):
         area=self.application.primaryScreen().availableGeometry()
         orb=self.orb.geometry();ox,oy,ow=orb.x(),orb.y(),orb.width()

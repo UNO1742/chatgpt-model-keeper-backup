@@ -45,8 +45,13 @@
   // No on-page widget: the page stays untouched, and every state goes to the
   // desktop app, which owns the single "自动检测并调整" switch.
   let report={mode:'—',state:'等待',detail:'正在连接本机程序'};
+  // Latest model / effort lists read from the page, with the mode they belong
+  // to. Sticky across states so the card can copy the page even while a retry
+  // is pending.
+  let pageLists={models:[],efforts:[],forModel:'',mode:null};
   function show(state,detail,m=mode(),extra) {
-    report={mode:m==='chat'?'聊天':m==='work'?'工作':'未识别',state,detail,...extra};
+    const keep=pageLists.mode===m?{models:pageLists.models,efforts:pageLists.efforts,forModel:pageLists.forModel}:{};
+    report={mode:m==='chat'?'聊天':m==='work'?'工作':'未识别',state,detail,...keep,...extra};
   }
   for(const event of ['pointerdown','keydown','input']) document.addEventListener(event,e=>{
     if(e.isTrusted) {lastInput=Date.now();epoch++;}
@@ -74,6 +79,56 @@
     }
     const checked=all('[role="menuitemradio"][aria-checked="true"]',menu);
     return checked.map(e=>canonical(e.textContent)).find(Boolean)||null;
+  }
+  // Pro / Ultra stay out of the presets even when the page offers them: they are
+  // the expensive tiers this tool is meant to keep the user away from.
+  const blockedModel = name => /(?:^|[^a-z0-9])(pro|ultra)(?:[^a-z0-9]|$)/i.test(String(name||''));
+  function harvestModels(menu) {
+    // The picker keeps its full list in the DOM even while the simple slider
+    // view is showing, so this needs no extra clicking.
+    const names=[];
+    for(const row of menu.querySelectorAll('[role="menuitemradio"]')) {
+      if(row.getAttribute('aria-disabled')==='true' || row.hasAttribute('disabled')) continue;
+      if(row.querySelector('[data-icon="lock"]') || /locked|已锁定/i.test(row.getAttribute('aria-label')||'')) continue;
+      const name=String(row.textContent||'').replace(/\s+/g,' ').trim();
+      if(!name || name.length>60 || blockedModel(name) || names.includes(name)) continue;
+      names.push(name);
+    }
+    return names.slice(0,16);
+  }
+  // The levels a model really supports, in slider order. Read straight from the
+  // tick labels when they carry text; otherwise sweep the real slider once per
+  // model and remember the answer, so the card never offers a level the
+  // webpage would reject.
+  const effortCache=new Map();
+  async function learnEfforts(key, step, getMenu) {
+    if(effortCache.has(key)) return effortCache.get(key);
+    let menu=await getMenu();
+    const fromTicks=[...new Set([...menu.querySelectorAll('[class*="Tick-"]')]
+      .map(e=>canonical(String(e.textContent||'').trim())).filter(Boolean))];
+    if(fromTicks.length>1) {effortCache.set(key,fromTicks);return fromTicks;}
+    let slider=menu.querySelector('[role="slider"]');
+    if(!slider || !unique(all('[data-reasoning-slider="true"]',menu))) return null;
+    const min=Number(slider.getAttribute('aria-valuemin')),max=Number(slider.getAttribute('aria-valuemax')),now=Number(slider.getAttribute('aria-valuenow'));
+    if(!Number.isFinite(min)||!Number.isFinite(max)||!Number.isFinite(now)||max<=min||max-min>8) return null;
+    async function press(name) {
+      await step(()=>{
+        const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
+        if(!keyboard) throw Error('思考强度滑块已关闭');
+        keyboard.focus({preventScroll:true});
+        keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));
+      });
+      menu=await getMenu();
+    }
+    const seen=[];
+    const take=()=>{const id=readEffort(menu);if(id&&!seen.includes(id))seen.push(id);};
+    for(let i=0;i<max-min;i++) await press('ArrowLeft');
+    seen.length=0;take();
+    for(let i=0;i<max-min;i++) {await press('ArrowRight');take();}
+    for(let i=0;i<max-now;i++) await press('ArrowLeft');
+    if(seen.length<2) return null;
+    effortCache.set(key,seen);
+    return seen;
   }
   async function enforce(preset, expectedMode) {
     const initialEpoch=epoch, url=location.href, initialFocus=document.activeElement;
@@ -107,6 +162,11 @@
       if(!current) throw Error('无法读取当前模型；停止操作');
       const beforeEffort=readEffort(menu);
       previous=`${current} · ${labels[beforeEffort]?.[0]||'—'}`;
+      // What this page really offers, kept module-level so a failure below still
+      // reaches the card and stops it from offering an impossible level again.
+      const offers={models:harvestModels(menu),efforts:await learnEfforts(`${expectedMode}|${current}`,step,getMenu)};
+      pageLists={models:offers.models,efforts:offers.efforts||[],forModel:current,mode:expectedMode};
+      menu=await getMenu();
       if(norm(current)!==norm(preset.model)) {
         changed=true;
         const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
@@ -149,11 +209,16 @@
         if(!found) {
           for(let i=0;i<=max-min;i++) await key('ArrowLeft');
           for(let i=min;i<original;i++) await key('ArrowRight');
-          throw Error(`目标模型不支持 ${labels[preset.effort]?.join(' / ')||preset.effort}，已恢复原强度`);
+          const only=(offers.efforts||[]).map(id=>labels[id]?.[0]||id).join(' / ');
+          throw Error(`目标模型只支持 ${only||'其他强度'}，已恢复原强度`);
         }
       }
       menu=await getMenu();
       if(norm(selectedModel(menu))!==norm(preset.model)||readEffort(menu)!==preset.effort) throw Error('设置未通过选中状态复核');
+      // The full list is only visible in the model view, so refresh it from
+      // whichever view is on screen now.
+      const names=harvestModels(menu);
+      if(names.length) {offers.models=names;pageLists={...pageLists,models:names};}
       return {text:`${preset.model} · ${labels[preset.effort][0]}`,changed,previous};
     } finally {await close();}
   }

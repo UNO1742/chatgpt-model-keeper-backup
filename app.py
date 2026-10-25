@@ -16,7 +16,7 @@ import winreg
 import extension_deploy
 
 HOST = 'local.chatgpt.modelkeeper'
-VERSION = '2.7.1'
+VERSION = '2.8.0'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_VALUE = 'ChatGPTModelKeeper'
 def installation_root():
@@ -54,6 +54,22 @@ MODELS = {'chat': ['GPT-6', 'GPT-5.6 Sol'],
 EFFORTS = [('none','即时 / Instant'), ('low','轻度 / Light'),
            ('medium','中 / Medium'), ('high','高 / High'), ('xhigh','极高 / Extra high')]
 MODE_EFFORTS = {'chat': EFFORTS, 'work': EFFORTS[1:]}
+EFFORT_IDS = {key for key, _ in EFFORTS}
+# Pro and Ultra are exactly what a preset is supposed to keep people off.
+BLOCKED_MODEL = re.compile(r'(?:^|[^a-z0-9])(pro|ultra)(?:[^a-z0-9]|$)', re.IGNORECASE)
+
+def clean_models(value):
+    """Model names as reported by the page, minus the tiers we never offer."""
+    if not isinstance(value, list): return []
+    names = []
+    for item in value[:16]:
+        name = ' '.join(str(item or '').split())[:60]
+        if name and not BLOCKED_MODEL.search(name) and name not in names: names.append(name)
+    return names
+
+def clean_efforts(value):
+    if not isinstance(value, list): return []
+    return [item for item in (str(v) for v in value[:8]) if item in EFFORT_IDS]
 
 def atomic_write(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -278,6 +294,11 @@ def native_main():
                            for k in ('mode','state','detail','previous','applied','seq')}
                 allowed['changed'] = '1' if report.get('changed') else '0'
                 allowed['time'] = time.strftime('%H:%M:%S')
+                # What the page actually offers, so the card can copy it instead
+                # of shipping a hard-coded guess.
+                allowed['models'] = clean_models(report.get('models'))
+                allowed['efforts'] = clean_efforts(report.get('efforts'))
+                allowed['forModel'] = ' '.join(str(report.get('forModel') or '').split())[:60]
                 reports[str(req.get('tab', 0))[:20]] = allowed
                 reports = dict(list(reports.items())[-12:])
                 atomic_write(ROOT / 'status.json', {'updated': time.time(), 'tabs': reports})

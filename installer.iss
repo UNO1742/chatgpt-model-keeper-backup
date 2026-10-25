@@ -1,4 +1,4 @@
-#define AppVersion "2.7.1"
+#define AppVersion "2.8.0"
 [Setup]
 AppId={{E56E50CE-D80C-4D7C-92D7-4FD4647C3652}
 AppName=ChatGPT 模型锁定器
@@ -38,4 +38,18 @@ Type: filesandordirs; Name: "{app}\runtime"
 function ShouldLaunch(): Boolean;
 begin
   Result := ExpandConstant('{param:NOLAUNCH|0}') <> '1';
+end;
+
+{ Edge keeps a native-messaging host alive for every open port, and that process
+  holds ModelKeeperHost.exe, which makes Inno fail with "DeleteFile failed code
+  5" and roll the whole upgrade back. Restart Manager cannot ask a windowless
+  process to close, so stop both processes before any file is replaced. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill.exe', '/F /IM ModelKeeperHost.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill.exe', '/F /IM ModelKeeper.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+  Result := '';
 end;
