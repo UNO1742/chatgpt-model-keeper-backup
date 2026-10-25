@@ -22,4 +22,6 @@
   <div class="actions"><div class="action-row"><span>浏览器扩展</span><button id="extension-action" type="button" data-state="idle" aria-label="安装浏览器扩展">安装</button></div><button id="update"><span id="update-label">检查更新</span><small id="version"></small></button></div>
   <p id="status" role="status">正在连接本机程序…</p>
   <div id="guide" role="dialog" aria-modal="true" aria-label="浏览器扩展" hidden><div class="guide-title">连接到 Edge<button id="guide-close" class="icon" aria-label="关闭安装说明">×</button></div><p>自动准备扩展文件、复制路径并打开 Edge。首次加载需在浏览器中完成一次。</p><button id="prepare-extension" class="primary cursor-interaction h-10 rounded-full bg-background-primary-solid text-primary-solid px-4 text-sm font-medium hover:bg-background-primary-solid-hover">一键准备安装</button><ol><li>在打开的扩展页开启<strong>开发人员模式</strong></li><li>点击<strong>加载解压缩的扩展</strong></li><li>粘贴已复制的路径，选择文件夹；然后刷新 ChatGPT</li></ol><div class="guide-buttons"><button id="copy-path">复制路径</button><button id="open-folder">打开文件夹</button></div><p id="guide-state" role="status">本机接口已由安装程序注册，连接成功后这里会自动确认。</p></div>
-</main><script src="qwebchannel.js"></script><script type="module" src="app.js"></script></body></html>
+</main>
+<div id="toast" hidden><div class="bubble"><div class="row"><span class="spark" aria-hidden="true"></span><span id="toast-title">已切回预设</span></div><p id="toast-detail"></p></div></div>
+<script src="qwebchannel.js"></script><script type="module" src="app.js"></script></body></html>

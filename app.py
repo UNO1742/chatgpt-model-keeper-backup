@@ -16,7 +16,7 @@ import winreg
 import extension_deploy
 
 HOST = 'local.chatgpt.modelkeeper'
-VERSION = '2.6.0'
+VERSION = '2.7.0'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_VALUE = 'ChatGPTModelKeeper'
 def installation_root():
@@ -274,7 +274,9 @@ def native_main():
             if req.get('type') == 'status':
                 # Only fixed status fields. No URL, title or conversation content.
                 report = req.get('report', {})
-                allowed = {k: str(report.get(k, ''))[:240] for k in ('mode','state','detail')}
+                allowed = {k: str(report.get(k, ''))[:240]
+                           for k in ('mode','state','detail','previous','applied','seq')}
+                allowed['changed'] = '1' if report.get('changed') else '0'
                 allowed['time'] = time.strftime('%H:%M:%S')
                 reports[str(req.get('tab', 0))[:20]] = allowed
                 reports = dict(list(reports.items())[-12:])

@@ -2,6 +2,7 @@
 import ctypes
 import hashlib
 import json
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -10,7 +11,6 @@ import subprocess
 import sys
 import threading
 import time
-from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -40,13 +40,19 @@ class Bridge(QObject):
             message=json.loads(raw);action=message.get('action');data=message.get('data') or {}
             owner=self.owner
             if action=='ready':
-                if data.get('orb'):
+                view=data.get('view')
+                if view=='orb':
                     owner.orb_ready=True
                     if owner.runtime_ready:self.send('runtimeReady')
+                elif view=='toast':
+                    owner.toast_ready=True
                 else:
                     owner.panel_ready=True;owner.initial();owner.status()
+                    owner.push_enter()
                     if owner.runtime_ready:self.send('runtimeReady')
-            elif action=='hide':owner.panel.hide()
+            elif action=='hide':owner.close_panel()
+            elif action=='panelHidden':owner.hidden_by_page()
+            elif action=='toastDone':owner.toast.hide()
             elif action=='panelDragStart':owner.panel_drag=(QCursor.pos(),owner.panel.pos())
             elif action=='panelDragMove' and owner.panel_drag:
                 cursor,position=owner.panel_drag
@@ -58,7 +64,7 @@ class Bridge(QObject):
             elif action=='dragStart':owner.drag_start=(QCursor.pos(),owner.orb.pos())
             elif action=='dragMove' and owner.drag_start:
                 cursor,position=owner.drag_start;owner.orb.move(owner.clamp(position+QCursor.pos()-cursor))
-                owner.panel.hide()
+                owner.close_panel(instant=True);owner.toast.hide()
             elif action=='dragEnd':
                 owner.drag_start=None
                 if data.get('moved'):api.atomic_write(api.ROOT/'ui.json',{'x':owner.orb.x(),'y':owner.orb.y()})
@@ -151,8 +157,11 @@ class Page(QWebEnginePage):
 class View(QWebEngineView):
     def __init__(self,owner,kind,width,height):
         super().__init__();self.owner=owner;self.kind=kind
-        self.setWindowTitle('ChatGPT 模型锁定器 · '+('实时语音球' if kind=='orb' else '模型设置'))
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint|Qt.WindowType.Tool)
+        self.setWindowTitle('ChatGPT 模型锁定器 · '+{'orb':'实时语音球','settings':'模型设置','toast':'纠正提示'}[kind])
+        flags=Qt.WindowType.FramelessWindowHint|Qt.WindowType.WindowStaysOnTopHint|Qt.WindowType.Tool
+        if kind=='toast':flags|=Qt.WindowType.WindowDoesNotAcceptFocus
+        self.setWindowFlags(flags)
+        if kind=='toast':self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating,True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground,True)
         self.resize(width,height)
         page=Page(self);page.setBackgroundColor(QColor(0,0,0,0));self.setPage(page)
@@ -170,6 +179,7 @@ class Desktop(QObject):
         self.events.completed.connect(self.completed)
         self.runtime_ready=False;self.runtime_error='';self.orb_ready=False;self.panel_ready=False;self.runtime_event=threading.Event()
         self.panel_drag=None;self.mouse_buttons=0;self.guard_pending=False
+        self.panel_closing=False;self.panel_enter=None;self.seen_corrections=None
         self.console_errors=[];self.release=None;self.drag_start=None;self.token=secrets.token_urlsafe(24)
         manifest=json.loads((api.ASSETS/'runtime_manifest.json').read_text(encoding='utf-8'))
         self.runtime_files={'runtime/'+entry['path'] for entry in manifest['files']}
@@ -179,7 +189,10 @@ class Desktop(QObject):
         self.webchannel_js=bytes(file.readAll());file.close()
         self.server=ThreadingHTTPServer(('127.0.0.1',0),LocalFiles);self.server.owner=self
         threading.Thread(target=self.server.serve_forever,daemon=True).start()
-        self.orb=View(self,'orb',80,80);self.panel=View(self,'settings',360,650)
+        self.orb=View(self,'orb',80,80);self.panel=View(self,'settings',384,674)
+        # Third view: the correction bubble. Lazy-free (created once) so a toast
+        # never waits for a page load when a correction lands.
+        self.toast=View(self,'toast',328,126);self.toast_ready=False
         # Limit hit area to the visible small orb, instead of a large transparent overlay.
         self.orb.setMask(QRegion(2,2,76,76,QRegion.RegionType.Ellipse))
         screen=application.primaryScreen().availableGeometry()
@@ -206,7 +219,7 @@ class Desktop(QObject):
         point=QCursor.pos()
         # The orb handles its own toggle on release, avoiding an accidental reopen.
         if self.orb.geometry().contains(point):return
-        if not self.panel.geometry().adjusted(12,12,-12,-12).contains(point):self.panel.hide()
+        if not self.panel.geometry().adjusted(12,12,-12,-12).contains(point):self.close_panel()
     def clamp(self,p):
         area=self.application.primaryScreen().availableGeometry()
         return QPoint(max(area.left(),min(p.x(),area.right()-80)),max(area.top(),min(p.y(),area.bottom()-80)))
@@ -259,38 +272,117 @@ class Desktop(QObject):
         self.bridge.send('initial',config=api.load_config(),startup=api.startup_enabled(),version=api.VERSION,
             models=api.MODELS,efforts=api.MODE_EFFORTS,theme=api.load_appearance()['theme'],status=self.runtime_error or '原始网页动效 · 实时 WebGL 渲染')
     def status(self):
-        if not self.panel_ready or not self.panel.isVisible():return
-        connected=False;text='等待 Edge 扩展连接。'
+        connected=False;text='等待 Edge 扩展连接。';data=None
         try:
             data=json.loads((api.ROOT/'status.json').read_text(encoding='utf-8'))
             connected=time.time()-data['updated']<20 and bool(data['tabs'])
             if connected:
                 r=list(data['tabs'].values())[-1];text=f"{r['mode']} · {r['state']} · {r['detail']}"
         except (OSError,ValueError,KeyError,TypeError):pass
+        if data:self.scan_corrections(data)
         if self.runtime_error:text=self.runtime_error
+        if not self.panel_ready or not self.panel.isVisible():return
         state=extension_deploy.state(api.ROOT)
-        installed=state['installed']
-        self.bridge.send('status',text=text,connected=connected,extension=installed,extensionEnabled=state['enabled'])
-    def toggle_panel(self):
-        if self.panel.isVisible():self.panel.hide();return
-        area=self.application.primaryScreen().availableGeometry();x=self.orb.x()-280;y=self.orb.y()-655
-        x=max(area.left(),min(x,area.right()-360));y=max(area.top(),min(y,area.bottom()-650))
-        self.panel.move(x,y)
-        # Refresh while hidden: the card is already filled when the first frame is
-        # composited, so opening never shows stale values snapping into place.
+        self.bridge.send('status',text=text,connected=connected,extension=state['installed'],extensionEnabled=state['enabled'])
+    def scan_corrections(self,data):
+        # The extension reports {changed, previous, applied, seq}; anything new
+        # since the last sweep becomes a bubble under the ball. The first sweep
+        # only primes the seen set, so restarting never replays old news.
+        try:stale=time.time()-float(data['updated'])>25
+        except (KeyError,TypeError,ValueError):return
+        current={}
+        for tab,report in (data.get('tabs') or {}).items():
+            if str(report.get('changed'))!='1':continue
+            current[(str(tab),str(report.get('seq') or report.get('time') or ''))]=report
+        if self.seen_corrections is None:
+            self.seen_corrections=set(current);return
+        fresh=[(key,report) for key,report in current.items() if key not in self.seen_corrections]
+        self.seen_corrections=set(current)
+        if not fresh or stale or self.panel.isVisible():return
+        self.show_toast(fresh[-1][1])
+    def show_toast(self,report):
+        applied=str(report.get('applied') or '').strip()
+        previous=str(report.get('previous') or '').strip()
+        detail=f'网页上原来是 {previous}，已自动纠正' if previous else '网页上的模型和预设不一致，已自动纠正'
+        area=self.application.primaryScreen().availableGeometry()
+        orb=self.orb.geometry();width=self.toast.width();height=self.toast.height()
+        cx=orb.x()+orb.width()//2
+        below=orb.y()+orb.height()+8
+        above=orb.y()-8-height
+        # Prefer the bubble under the ball; flip above when the desk edge is
+        # closer than the bubble is tall (the default spot is 65 px from the
+        # bottom, so it usually flips).
+        high=below+height>area.bottom()+1 and above>=area.top()
+        y=above if high else below
+        x=max(area.left(),min(cx-width//2,area.right()-width+1))
+        self.toast.move(QPoint(int(x),int(y)))
+        self.toast.show();self.toast.raise_()
+        tail=max(24,min(int(cx-x-8),width-32))
+        title='已按预设切回 '+(applied or '目标模型')
+        # Give the freshly raised window one paint before the bubble animates in.
+        QTimer.singleShot(30,lambda:self.bridge.send('toast',title=title,detail=detail,above=high,tail=tail))
+        # The page normally reports back after its 5.2 s dwell; this bounds the
+        # bubble even if that message is lost.
+        QTimer.singleShot(9000,self.toast.hide)
+    def panel_placement(self):
+        area=self.application.primaryScreen().availableGeometry()
+        orb=self.orb.geometry();ox,oy,ow=orb.x(),orb.y(),orb.width()
+        right,bottom=ox+ow,oy+ow;cx,cy=ox+ow//2,oy+ow//2
+        width,height=self.panel.width(),self.panel.height()
+        inset,gap,gapx=24,6,14
+        card_w,card_h=width-2*inset,height-2*inset
+        candidates=[('上方',right-card_w-inset,oy-gap-card_h-inset),
+                    ('下方',right-card_w-inset,bottom+gap-inset),
+                    ('右侧',right+gapx-inset,cy-card_h//2-inset),
+                    ('左侧',ox-gapx-card_w-inset,cy-card_h//2-inset)]
+        def fits(x,y):
+            return x>=area.left() and y>=area.top() and x+width<=area.right()+1 and y+height<=area.bottom()+1
+        pick=next(((name,x,y) for name,x,y in candidates if fits(x,y)),None)
+        if pick is None:
+            def over(x,y):
+                return (max(0,area.left()-x)+max(0,area.top()-y)+
+                        max(0,x+width-area.right()-1)+max(0,y+height-area.bottom()-1))
+            pick=min(candidates,key=lambda item:over(item[1],item[2]))
+        x=max(area.left(),min(pick[1],area.right()-width+1))
+        y=max(area.top(),min(pick[2],area.bottom()-height+1))
+        origin={'x':cx-(x+inset),'y':cy-(y+inset)}
+        dx,dy=(x+inset+card_w/2)-cx,(y+inset+card_h/2)-cy
+        length=math.hypot(dx,dy) or 1
+        return QPoint(int(x),int(y)),origin,{'x':round(dx/length,3),'y':round(dy/length,3)}
+    def open_panel(self):
+        if self.panel.isVisible():return
+        self.toast.hide()
+        point,origin,direction=self.panel_placement()
+        self.panel.move(point)
+        self.panel_enter={'origin':origin,'dir':direction}
+        # Fill while the card is still transparent: it is already correct when
+        # the enter animation starts, so nothing snaps into place mid-flight.
         if self.panel_ready:self.initial();self.status()
-        self.panel.setWindowOpacity(0.0)
+        self.panel.setWindowOpacity(1.0)
         self.panel.show();self.panel.raise_()
-        self.fade_panel(1)
-    FADE=(0.2,0.45,0.7,0.9,1.0)
-    def fade_panel(self,step):
-        # A frameless translucent QWebEngineView can present one unstyled frame
-        # when it is mapped. Mapping it fully transparent and ramping opacity in
-        # ~65 ms hides that frame instead of letting it flash.
-        if not self.panel.isVisible():
-            self.panel.setWindowOpacity(1.0);return
-        self.panel.setWindowOpacity(self.FADE[step-1])
-        if step<len(self.FADE):QTimer.singleShot(16,partial(self.fade_panel,step+1))
+        self.push_enter()
+    def push_enter(self):
+        # The page may not exist yet on the very first open; the payload waits
+        # for its "ready" and is delivered from there.
+        payload=self.panel_enter
+        if payload and self.panel_ready and self.panel.isVisible():
+            self.panel_enter=None
+            self.bridge.send('panelEnter',**payload)
+            self.orb.bridge.send('pulse')
+    def close_panel(self,instant=False):
+        if not self.panel.isVisible() or self.panel_closing:return
+        if instant or not self.panel_ready:
+            self.panel.hide();return
+        # The page plays the 150 ms exit and reports back; the fallback below
+        # hides the window even if that message never arrives.
+        self.panel_closing=True
+        self.bridge.send('panelExit')
+        QTimer.singleShot(320,self.hidden_by_page)
+    def hidden_by_page(self):
+        self.panel_closing=False;self.panel.hide()
+    def toggle_panel(self):
+        if self.panel.isVisible():self.close_panel()
+        else:self.open_panel()
     def context(self):
         light=api.load_appearance()['theme']=='light'
         menu=QMenu();menu.setStyleSheet('QMenu{background:'+('#fff;color:#171717' if light else '#202020;color:#eee')+';border:1px solid #777;border-radius:10px;padding:7px} QMenu::item{padding:8px 15px} QMenu::item:selected{background:'+('#e9e9e9' if light else '#3a3a3a')+'}')
@@ -319,7 +411,7 @@ class Desktop(QObject):
         QTimer.singleShot(800,lambda:self.orb.page().runJavaScript('JSON.stringify({kind:window.orbKind,draws:window.orbDraws,canvases:document.querySelectorAll("canvas").length,body:document.body?.innerText.slice(0,100)})',finish))
     def shutdown(self):
         self.timer.stop();self.server.shutdown();self.server.server_close()
-        self.orb.close();self.panel.close()
+        self.orb.close();self.panel.close();self.toast.close()
 
 def run():
     application=QApplication(sys.argv);application.setQuitOnLastWindowClosed(False)

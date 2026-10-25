@@ -157,7 +157,10 @@
       return {text:`${preset.model} · ${labels[preset.effort][0]}`,changed,previous};
     } finally {await close();}
   }
-  let confirmed=null, lastAudit=0;
+  let confirmed=null, lastAudit=0, corrections=0;
+  // Corrections are rare: push one immediately instead of waiting for the next
+  // 3 s poll, otherwise the bubble shows up noticeably late.
+  async function flush() {try {await chrome.runtime.sendMessage({type:'sync',report});} catch {}}
   async function tick() {
     if(busy || document.hidden) return;
     busy=true;
@@ -185,7 +188,8 @@
       const result=await enforce(cfg[m],m);
       confirmed={node:trigger(),stamp:trigger()?.getAttribute('data-selected-reasoning-effort')+'|'+trigger()?.textContent};
       lastAudit=Date.now();failures=0;
-      show('已确认',result.text,m,result.changed?{changed:true,previous:result.previous,applied:result.text}:undefined);
+      show('已确认',result.text,m,result.changed?{changed:true,previous:result.previous,applied:result.text,seq:++corrections}:undefined);
+      if(result.changed) void flush();
     } catch(e) {
       if(/本轮已取消/.test(e.message)) {confirmed=null;retryAt=Date.now()+3000;show('等待','被你的操作或页面切换打断，3 秒后自动重试');}
       else {failures++;retryAt=Date.now()+30000;show('无法调整',`${e.message} · 第 ${failures}/3 次失败，30 秒后重试`);}

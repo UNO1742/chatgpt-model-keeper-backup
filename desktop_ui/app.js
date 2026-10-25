@@ -1,10 +1,11 @@
 import * as originalSlider from './original_component.js';
-const isOrb=new URLSearchParams(location.search).get('view')==='orb';
+const view=new URLSearchParams(location.search).get('view')||'settings';
+const isOrb=view==='orb',isPanel=view==='settings',isToast=view==='toast';
 const $=s=>document.querySelector(s);
-$('#orb').hidden=!isOrb;$('#card').hidden=isOrb;
+$('#orb').hidden=!isOrb;$('#card').hidden=!isPanel;$('#toast').hidden=!isToast;
 let bridge,release=null,models={chat:[],work:[]},efforts={chat:[],work:[]},orbLoading=false;
 const sliderInstances={},sliderLoads={};
-function notice(s){if(!isOrb)$('#status').textContent=s;}
+function notice(s){if(isPanel)$('#status').textContent=s;}
 function request(action,data){bridge.request(JSON.stringify({action,data}));}
 function setTheme(theme){document.documentElement.dataset.theme=theme;for(const t of ['light','dark'])$('#theme-'+t).setAttribute('aria-pressed',String(t===theme));}
 // Extension row keeps a placeholder action button. Wiring the real install flow is
@@ -63,24 +64,73 @@ async function startOrb(){
   window.orbController=controller;window.addEventListener('pagehide',()=>controller.dispose());
   window.orbKind='HorizonVoiceOrbController/live';
 }
+// Motion lives in the page: Qt only shows the window and says where the orb is.
+// transform-origin is the orb centre mapped into card coordinates, so the card
+// grows out of the ball whichever side it was placed on.
+let panelAnim=null,panelDir={x:0,y:-1},toastAnim=null,toastTimer=0,toastHover=false;
+function panelEnter(m){
+  const card=$('#card'),origin=m.origin||{x:168,y:313},dir=m.dir||{x:0,y:-1};
+  panelDir=dir;
+  card.style.transformOrigin=origin.x+'px '+origin.y+'px';
+  card.classList.add('on');
+  if(panelAnim)panelAnim.cancel();
+  const dx=(-dir.x*16).toFixed(1),dy=(-dir.y*16).toFixed(1);
+  panelAnim=card.animate([{opacity:0,transform:`translate(${dx}px,${dy}px) scale(.9)`},{opacity:1,transform:'none'}],{duration:220,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});
+  panelAnim.onfinish=()=>{card.style.opacity='1';card.style.transform='none';panelAnim=null;};
+  // Safety net: if the frame clock is throttled the card would stay at opacity
+  // 0, i.e. an open window with nothing in it. Force the settled state.
+  setTimeout(()=>{if(card.style.opacity!=='1'){if(panelAnim)panelAnim.cancel();panelAnim=null;card.style.opacity='1';card.style.transform='none';}},450);
+}
+function panelExit(){
+  const card=$('#card'),dir=panelDir;
+  if(panelAnim)panelAnim.cancel();
+  const dx=(-dir.x*10).toFixed(1),dy=(-dir.y*10).toFixed(1);
+  panelAnim=card.animate([{opacity:1,transform:'none'},{opacity:0,transform:`translate(${dx}px,${dy}px) scale(.96)`}],{duration:150,easing:'cubic-bezier(.4,0,1,1)',fill:'both'});
+  panelAnim.onfinish=()=>{panelAnim=null;card.classList.remove('on');card.style.opacity='';card.style.transform='';request('panelHidden');};
+}
+function showToast(m){
+  const root=$('#toast'),bubble=root.querySelector('.bubble');
+  root.classList.toggle('up',!!m.above);
+  root.style.setProperty('--tail',(m.tail||156)+'px');
+  $('#toast-title').textContent=m.title||'已切回预设';
+  $('#toast-detail').textContent=m.detail||'';
+  if(toastAnim)toastAnim.cancel();
+  clearTimeout(toastTimer);
+  const from=m.above?-10:10;
+  toastAnim=bubble.animate([{opacity:0,transform:`translateY(${from}px) scale(.94)`},{opacity:1,transform:'none'}],{duration:460,easing:'cubic-bezier(.2,.9,.25,1)',fill:'both'});
+  toastAnim.onfinish=()=>{bubble.style.opacity='1';bubble.style.transform='none';};
+  setTimeout(()=>{if(bubble.style.opacity!=='1'){if(toastAnim)toastAnim.cancel();bubble.style.opacity='1';bubble.style.transform='none';}},600);
+  scheduleToastHide();
+}
+function scheduleToastHide(){clearTimeout(toastTimer);if(toastHover)return;toastTimer=setTimeout(hideToast,5200);}
+function hideToast(){
+  const bubble=$('#toast .bubble');
+  if(toastAnim)toastAnim.cancel();
+  toastAnim=bubble.animate([{opacity:1,transform:'none'},{opacity:0,transform:'translateY(-6px) scale(.97)'}],{duration:180,easing:'cubic-bezier(.4,0,1,1)',fill:'both'});
+  toastAnim.onfinish=()=>{toastAnim=null;bubble.style.opacity='';bubble.style.transform='';request('toastDone');};
+}
 new QWebChannel(qt.webChannelTransport,channel=>{
   bridge=channel.objects.bridge;
   bridge.message.connect(raw=>{
     const m=JSON.parse(raw);
-    if(m.type==='initial'&&!isOrb){fill(m);notice(m.status||'已准备就绪');}
-    if(m.type==='theme'&&!isOrb)setTheme(m.theme);
-    if(m.type==='status'&&!isOrb){notice(m.text);if(typeof m.extension==='boolean')setExtensionInstalled(m.extension);}
-    if(m.type==='extensionState'&&!isOrb)setExtensionInstalled(!!m.state?.installed);
-    if(m.type==='extensionPrepared'&&!isOrb)$('#guide-state').textContent='路径已复制：'+m.path+'。在文件夹选择框中粘贴并确认。';
-    if(m.type==='showGuide'&&!isOrb){$('#guide').hidden=false;$('#prepare-extension').focus();}
+    if(m.type==='initial'&&isPanel){fill(m);notice(m.status||'已准备就绪');}
+    if(m.type==='theme'&&isPanel)setTheme(m.theme);
+    if(m.type==='status'&&isPanel){notice(m.text);if(typeof m.extension==='boolean')setExtensionInstalled(m.extension);}
+    if(m.type==='extensionState'&&isPanel)setExtensionInstalled(!!m.state?.installed);
+    if(m.type==='extensionPrepared'&&isPanel)$('#guide-state').textContent='路径已复制：'+m.path+'。在文件夹选择框中粘贴并确认。';
+    if(m.type==='showGuide'&&isPanel){$('#guide').hidden=false;$('#prepare-extension').focus();}
     if(m.type==='notice')notice(m.text);
-    if(m.type==='release'&&!isOrb){release=m.release;$('#update').disabled=false;$('#update-label').textContent=release.newer?'安装更新 '+release.tag:'已是最新版 · '+release.tag;notice(release.newer?'更新来自 GitHub Releases，下载后将校验 SHA-256。':'当前已是 GitHub 最新稳定版。');}
-    if(m.type==='updateError'&&!isOrb){$('#update').disabled=false;notice(m.text);}
-    if(m.type==='runtimeReady'&&!isOrb){const link=$('#web-style');link.href=new URL('../runtime/web-ui.css',location.href).href+'?ready=1';}
+    if(m.type==='panelEnter'&&isPanel)panelEnter(m);
+    if(m.type==='panelExit'&&isPanel)panelExit();
+    if(m.type==='toast'&&isToast)showToast(m);
+    if(m.type==='pulse'&&isOrb){const o=$('#orb');o.classList.remove('pulse');void o.offsetWidth;o.classList.add('pulse');}
+    if(m.type==='release'&&isPanel){release=m.release;$('#update').disabled=false;$('#update-label').textContent=release.newer?'安装更新 '+release.tag:'已是最新版 · '+release.tag;notice(release.newer?'更新来自 GitHub Releases，下载后将校验 SHA-256。':'当前已是 GitHub 最新稳定版。');}
+    if(m.type==='updateError'&&isPanel){$('#update').disabled=false;notice(m.text);}
+    if(m.type==='runtimeReady'&&isPanel){const link=$('#web-style');link.href=new URL('../runtime/web-ui.css',location.href).href+'?ready=1';}
     if(m.type==='runtimeReady'&&isOrb)startOrb().catch(e=>{$('#orb-error').hidden=false;request('orbError',e.message);});
   });
   if(isOrb){let down=false,moved=false,x=0,y=0;const hit=$('#orb-hit');hit.onpointerdown=e=>{if(e.button!==0)return;down=true;moved=false;x=e.screenX;y=e.screenY;hit.setPointerCapture(e.pointerId);request('dragStart');};hit.onpointermove=e=>{if(down&&Math.abs(e.screenX-x)+Math.abs(e.screenY-y)>4){moved=true;request('dragMove');}};hit.onpointerup=e=>{if(!down)return;down=false;request('dragEnd',{moved});};hit.oncontextmenu=e=>{e.preventDefault();request('context');};}
-  else{
+  else if(isPanel){
     const header=$('header');let panelDragging=false;
     header.onpointerdown=e=>{if(e.button!==0||e.target.closest('button'))return;panelDragging=true;header.classList.add('dragging');header.setPointerCapture(e.pointerId);request('panelDragStart');};
     header.onpointermove=()=>{if(panelDragging)request('panelDragMove');};
@@ -112,5 +162,10 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     document.addEventListener('focusin',e=>{if(!e.target.closest('.model-field'))closeMenus();});
     document.onkeydown=e=>{if(e.key==='Escape'){if(!$('#guide').hidden){$('#guide-close').click();return;}if(document.querySelector('.model-menu:not([hidden])')){closeMenus();return;}request('hide');}if(e.key==='Tab'&&!$('#guide').hidden){const buttons=[...$('#guide').querySelectorAll('button:not([disabled])')],index=buttons.indexOf(document.activeElement);if(e.shiftKey&&index<=0){e.preventDefault();buttons.at(-1).focus();}else if(!e.shiftKey&&(index===buttons.length-1||index<0)){e.preventDefault();buttons[0].focus();}}};
   }
-  request('ready',{orb:isOrb});
+  else{
+    const bubble=$('#toast .bubble');
+    bubble.onpointerenter=()=>{toastHover=true;clearTimeout(toastTimer);};
+    bubble.onpointerleave=()=>{toastHover=false;scheduleToastHide();};
+  }
+  request('ready',{view});
 });
