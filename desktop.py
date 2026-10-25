@@ -219,7 +219,7 @@ class Desktop(QObject):
         point=QCursor.pos()
         # The orb handles its own toggle on release, avoiding an accidental reopen.
         if self.orb.geometry().contains(point):return
-        if not self.panel.geometry().adjusted(12,12,-12,-12).contains(point):self.close_panel()
+        if not self.panel.geometry().adjusted(24,24,-24,-24).contains(point):self.close_panel()
     def clamp(self,p):
         area=self.application.primaryScreen().availableGeometry()
         return QPoint(max(area.left(),min(p.x(),area.right()-80)),max(area.top(),min(p.y(),area.bottom()-80)))
