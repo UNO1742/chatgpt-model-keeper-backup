@@ -1,4 +1,4 @@
-#define AppVersion "2.4.0"
+#define AppVersion "2.4.1"
 [Setup]
 AppId={{E56E50CE-D80C-4D7C-92D7-4FD4647C3652}
 AppName=ChatGPT 模型锁定器

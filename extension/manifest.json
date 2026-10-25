@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT 模型锁定器",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "聊天与工作分别使用预设模型及思考程度，中英文适配。配合本机设置程序使用。",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAkPI2MqAmQgym/9w9pjnOdOWhjnTHUsJiOO3ALvMh3MH5ZZrSKq4k5u05uAgF8bOwpcUM3ifR1qYDtH40891Oy4LNTrt4iDqNUZ9SBaPT2UtQDgihORVe6QQAl5f3ySYc9kmNQ8BuKJDzca18Hvih4lzx94cF1l/00+Qke88MyoGsMTVYZ4e4ql8iI+ieQ18Aquqfc0KxjyHahaUSnsrSPsD0Xxvd7GUzYtUGSICEYkFcTSqrxBCWTqxJ/fwon13/RVZxqKO7PlXz9y9uOko2AYaOjaGJGym2iV+0Gn918oP9zrmV9geB4r+GDDx0tu7IryfxTrKZiJCaaeM8c6uXEwIDAQAB",
   "permissions": [

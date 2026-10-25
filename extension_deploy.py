@@ -70,11 +70,12 @@ def _create_key():
               '$p=$r.ExportParameters($true);'
               '[Convert]::ToBase64String($p.Modulus)+" "+[Convert]::ToBase64String($p.D)')
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
-                            capture_output=True, text=True, timeout=120,
+                            capture_output=True, timeout=120,
                             creationflags=_NO_WINDOW if os.name == 'nt' else 0)
-    if result.returncode != 0 or len(result.stdout.split()) != 2:
-        raise RuntimeError('无法生成扩展签名密钥：' + (result.stderr.strip()[:200] or 'PowerShell 未返回密钥'))
-    modulus, private = result.stdout.split()
+    stdout = (result.stdout or b'').decode('mbcs', 'replace')
+    if result.returncode != 0 or len(stdout.split()) != 2:
+        raise RuntimeError('无法生成扩展签名密钥：' + (result.stderr or b'').decode('mbcs', 'replace').strip()[:200] or 'PowerShell 未返回密钥')
+    modulus, private = stdout.split()
     return (int.from_bytes(base64.b64decode(modulus), 'big'),
             int.from_bytes(base64.b64decode(private), 'big'), 65537)
 
@@ -202,11 +203,18 @@ def state(root):
 
 
 def edge_running():
+    """Whether any Edge process exists.
+
+    `tasklist` prints localised text, so the output is matched as bytes: asking
+    for `text=True` without an encoding makes Python decode CP936 output as
+    UTF-8, the decode error is swallowed by the reader thread, `stdout` comes
+    back as None and the settings card dies with an AttributeError.
+    """
     try:
         result = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq msedge.exe', '/NH'],
-                                capture_output=True, text=True, timeout=20,
+                                capture_output=True, timeout=20,
                                 creationflags=_NO_WINDOW if os.name == 'nt' else 0)
-        return 'msedge.exe' in result.stdout.lower()
+        return b'msedge.exe' in (result.stdout or b'').lower()
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -222,13 +230,30 @@ def edge_binary():
     return None
 
 
-def _close_edge(timeout=25):
+def _close_edge(grace=6, timeout=20):
+    """Close Edge, then force it once the polite request has been ignored.
+
+    Edge normally keeps a background process alive (`--no-startup-window`) that
+    has no window to close, so the plain `taskkill` below never succeeds on its
+    own. That mattered: a new instance launched afterwards just hands its
+    command line to the surviving process and `--load-extension` is dropped,
+    which looked exactly like "the button did nothing".
+    """
+    flags = _NO_WINDOW if os.name == 'nt' else 0
     subprocess.run(['taskkill', '/IM', 'msedge.exe'], capture_output=True, timeout=20,
-                   creationflags=_NO_WINDOW if os.name == 'nt' else 0)
-    for _ in range(timeout * 5):
+                   creationflags=flags)
+    deadline = time.time() + grace
+    while time.time() < deadline:
         if not edge_running():
             return True
-        time.sleep(0.2)
+        time.sleep(0.3)
+    subprocess.run(['taskkill', '/F', '/T', '/IM', 'msedge.exe'], capture_output=True,
+                   timeout=20, creationflags=flags)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not edge_running():
+            return True
+        time.sleep(0.3)
     return not edge_running()
 
 
@@ -253,17 +278,38 @@ def deploy(root, folder=None, restart=True):
     manifest = sync_manifest(folder, root)
     ext_id = identifier(base64.b64decode(manifest['key']))
     version = str(manifest.get('version', '1.0'))
-    was_running = edge_running()
-    if was_running and not restart:
+    live = live_state(ext_id)
+    if live and live['enabled']:
+        # Already loaded: never bounce a browser for nothing.
         _write_marker(root, ext_id, version, folder)
-        return {'installed': True, 'enabled': False, 'id': ext_id, 'version': version,
-                'running': True, 'restarted': False, 'needsRestart': True}
+        return {'installed': True, 'enabled': True, 'id': ext_id, 'version': version,
+                'running': True, 'restarted': False}
+    was_running = edge_running()
+    if not was_running and not restart:
+        # Nothing to reuse and nothing to bounce: stay quiet so install does not
+        # pop a browser open by itself. `--load-extension` is a per-launch flag,
+        # so the settings row stays at "已安装，待启用" until the user clicks.
+        _write_marker(root, ext_id, version, folder)
+        return {'installed': True, 'enabled': bool(live and live['enabled']), 'id': ext_id,
+                'version': version, 'running': False, 'restarted': False, 'needsRestart': True}
     if was_running:
         _close_edge()
     _launch([LOAD_FLAG + str(folder)])
     _write_marker(root, ext_id, version, folder)
-    return {'installed': True, 'enabled': True, 'id': ext_id, 'version': version,
-            'running': True, 'restarted': was_running}
+    applied = _await_live(ext_id)
+    return {'installed': True, 'enabled': bool(applied and applied['enabled']),
+            'id': ext_id, 'version': version, 'running': True, 'restarted': was_running}
+
+
+def _await_live(ext_id, timeout=20):
+    """Edge writes the manifest entry a few seconds after the window appears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        entry = live_state(ext_id)
+        if entry:
+            return entry
+        time.sleep(0.5)
+    return live_state(ext_id)
 
 
 def refresh(root, folder=None):
