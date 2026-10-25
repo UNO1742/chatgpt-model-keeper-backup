@@ -169,7 +169,7 @@ class Desktop(QObject):
         super().__init__();self.application=application;self.bridge=Bridge(self);self.events=Events(self)
         self.events.completed.connect(self.completed)
         self.runtime_ready=False;self.runtime_error='';self.orb_ready=False;self.panel_ready=False;self.runtime_event=threading.Event()
-        self.panel_drag=None;self.mouse_buttons=0
+        self.panel_drag=None;self.mouse_buttons=0;self.guard_pending=False
         self.console_errors=[];self.release=None;self.drag_start=None;self.token=secrets.token_urlsafe(24)
         manifest=json.loads((api.ASSETS/'runtime_manifest.json').read_text(encoding='utf-8'))
         self.runtime_files={'runtime/'+entry['path'] for entry in manifest['files']}
@@ -191,6 +191,9 @@ class Desktop(QObject):
         # Only sample button state; no global hook, input interception or click replay.
         self.outside_timer=QTimer(self);self.outside_timer.timeout.connect(self.check_outside_click);self.outside_timer.start(25)
         self.timer=QTimer(self);self.timer.timeout.connect(self.status);self.timer.start(3000)
+        # Watchdog: keeps a windowless Edge anchored with the extension loaded,
+        # so opening Edge any way lands in a browser that already has it.
+        self.guard_timer=QTimer(self);self.guard_timer.timeout.connect(self.guard);self.guard_timer.start(8000)
         self.worker('runtime',lambda:ensure_runtime(api.ROOT,api.ASSETS))
         self.worker('extensionRefresh',api.refresh_extension)
         application.aboutToQuit.connect(self.shutdown)
@@ -212,27 +215,38 @@ class Desktop(QObject):
             try:self.events.completed.emit(kind,fn())
             except Exception as e:self.events.completed.emit(kind,{'error':str(e)})
         threading.Thread(target=task,daemon=True).start()
+    def guard(self):
+        if self.guard_pending:return
+        self.guard_pending=True
+        self.worker('extensionGuard',lambda:extension_deploy.guard(api.ROOT))
     @Slot(str,object)
     def completed(self,kind,value):
         if kind=='runtime':self.runtime_event.set()
+        if kind=='extensionGuard':self.guard_pending=False
         if isinstance(value,dict) and 'error' in value:
             if kind=='runtime':self.runtime_error='实时球资源加载失败：'+value['error']
-            if kind=='extensionRefresh':self.bridge.send('extensionState',state={'installed':False,'enabled':False});return
+            if kind in ('extensionRefresh','extensionGuard'):return
             if kind=='extension':
                 self.bridge.send('updateError',text='扩展部署失败：'+value['error']+'（可在悬浮球右键菜单中手动安装）');return
             self.bridge.send('updateError',text=self.runtime_error if kind=='runtime' else value['error']);return
         if kind=='runtime':
             self.runtime_ready=True
             if self.orb_ready:self.bridge.send('runtimeReady')
+        elif kind=='extensionGuard':
+            if value.get('action')=='restarted':
+                self.bridge.send('notice',text='Edge 已在后台重新加载扩展，标签页已恢复。' if value.get('windows') else '扩展已就绪，下次打开 Edge 自动生效。')
+                self.bridge.send('extensionState',state=extension_deploy.state(api.ROOT))
         elif kind=='extension':
             self.bridge.send('extensionState',state=value)
             if value.get('installed'):
-                if value.get('restarted'):
-                    self.bridge.send('notice',text='扩展已安装并启用，Edge 已重新打开。')
+                if value.get('enabled'):
+                    self.bridge.send('notice',text='扩展已启用，打开 Edge 即可使用。' if value.get('anchored') else '扩展已启用。')
+                elif value.get('needsRestart'):
+                    self.bridge.send('notice',text='扩展已登记，Edge 下次启动时自动启用。')
                 else:
-                    self.bridge.send('notice',text='扩展已安装，下次打开 Edge 时自动启用。')
+                    self.bridge.send('notice',text='扩展已登记，但 Edge 未接受，请重启浏览器后再试。')
             else:
-                self.bridge.send('notice',text='扩展注册已移除，重启 Edge 后生效。')
+                self.bridge.send('notice',text='扩展注册已移除。')
         elif kind=='edgeRestart':
             self.bridge.send('notice',text='Edge 已重启，扩展状态会在连接后自动刷新。')
         elif kind=='extensionRefresh':
@@ -268,6 +282,10 @@ class Desktop(QObject):
         menu=QMenu();menu.setStyleSheet('QMenu{background:'+('#fff;color:#171717' if light else '#202020;color:#eee')+';border:1px solid #777;border-radius:10px;padding:7px} QMenu::item{padding:8px 15px} QMenu::item:selected{background:'+('#e9e9e9' if light else '#3a3a3a')+'}')
         menu.addAction('模型设置',self.toggle_panel)
         menu.addAction('修复浏览器扩展',lambda:self.worker('extension',api.deploy_extension))
+        keep=menu.addAction('自动保持扩展启用')
+        keep.setCheckable(True);keep.setChecked(extension_deploy.guard_enabled(api.ROOT))
+        keep.toggled.connect(lambda checked:extension_deploy.set_guard_enabled(api.ROOT,checked))
+        menu.addAction('立即准备 Edge（后台加载扩展）',lambda:self.worker('extension',lambda:extension_deploy.deploy(api.ROOT,restart=False)))
         menu.addAction('手动安装扩展…',self.manual_extension)
         menu.addAction('项目与下载 · GitHub',lambda:QDesktopServices.openUrl(QUrl(github_updates.RELEASES)))
         menu.addSeparator();menu.addAction('退出悬浮窗',self.application.quit);menu.exec(QCursor.pos())

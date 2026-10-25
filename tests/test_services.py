@@ -89,6 +89,20 @@ class Services(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(RuntimeError):
                 deploy.deploy(Path(directory),Path(directory)/'missing')
+    def test_guard_preference_survives_marker_rewrite(self):
+        import extension_deploy as deploy
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            # Defaults on, and a later rewrite must not lose the explicit opt-out.
+            self.assertTrue(deploy.guard_enabled(root))
+            deploy.set_guard_enabled(root,False)
+            self.assertFalse(deploy.guard_enabled(root))
+            deploy._write_marker(root,'a'*32,'2.5.0',root/'extension')
+            self.assertFalse(deploy.guard_enabled(root))
+            deploy.set_guard_enabled(root,True)
+            self.assertTrue(deploy.guard_enabled(root))
+            self.assertIsInstance(deploy.visible_edge_windows(),list)
+            self.assertEqual(deploy.guard(Path(directory)),{'action':'idle','reason':'not-installed'})
     def test_extension_origins_dedupe_installed_and_bundled_keys(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app,'ROOT',Path(directory)):
             folder=app.ROOT/'extension';folder.mkdir()

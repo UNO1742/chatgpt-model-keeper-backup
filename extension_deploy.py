@@ -11,9 +11,20 @@ Edge 156 refuses side-loading in every classic way that used to work:
 
 What does work is the command line Edge itself uses for "load unpacked": start
 the browser once with ``--load-extension=<folder>``. Edge registers the folder as
-an unpacked extension, which keeps working on the following starts, and no
-browser UI is involved. So deployment is: pin the manifest key (stable ID that
-matches the native messaging allow-list), then restart Edge with that flag.
+an unpacked extension with no browser UI involved. That flag is per browser
+process, though, so a later plain launch does not inherit it.
+
+The stable trick is an "anchor": keep one windowless Edge process alive that was
+started with the flag (``--no-startup-window``, the same mode Edge uses for its
+own startup boost). Every later launch - taskbar, Start menu, a link in another
+app - hands its command line to that surviving process, so it opens a window
+inside a browser that already has the extension loaded. Measured on Edge
+156: a plain launch after the anchor reports ``location=8`` (COMMAND_LINE),
+no disable reasons and ``has_started_service_worker`` true.
+
+`guard()` keeps that anchor in place: it re-anchors when Edge exits, repairs a
+browser that was started without the flag, and gives up quietly after repeated
+failures instead of fighting the machine.
 
 The RSA key is still minted per machine: the public half goes into the installed
 manifest and decides the extension ID, so no signing secret ships with the app
@@ -32,7 +43,14 @@ KEY_FILE = 'extension_key.json'
 MARKER_FILE = 'extension_state.json'
 RSA_BITS = 2048
 LOAD_FLAG = '--load-extension='
+ANCHOR_FLAG = '--no-startup-window'
+RESTORE_FLAG = '--restore-last-session'
+DETACHED = 0x00000008
 _NO_WINDOW = 0x08000000
+LOADED_LOCATIONS = (4, 8)          # UNPACKED, COMMAND_LINE
+# Rate limits shared by every caller: a launch needs a few seconds to become
+# visible in the profile, and repeated failures must not turn into a loop.
+_guard = {'launch': 0.0, 'attempts': 0, 'suspend': 0.0}
 
 
 def _der_length(size):
@@ -167,6 +185,55 @@ def live_state(ext_id):
     return None
 
 
+def loaded_any(ext_id):
+    """True when a profile holds a live entry that came from loading the folder.
+
+    Only meaningful while Edge runs: Chromium writes the entry of a
+    command-line extension during the session and leaves it behind after the
+    browser exits, so a closed profile alone proves nothing.
+    """
+    if not ext_id:
+        return False
+    for pref in _profile_files():
+        entry = _read_entry(pref, ext_id)
+        if entry and entry['enabled'] and entry['location'] in LOADED_LOCATIONS:
+            return True
+    return False
+
+
+def visible_edge_windows():
+    """Titles of Edge windows the user can actually see."""
+    if os.name != 'nt':
+        return []
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL('user32', use_last_error=True)
+    titles = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def collect(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, name, 64)
+        if name.value != 'Chrome_WidgetWin_1':
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        if title.value:
+            titles.append(title.value)
+        return True
+
+    try:
+        user32.EnumWindows(collect, 0)
+    except OSError:
+        return []
+    return titles
+
+
 def _marker_path(root):
     return Path(root) / MARKER_FILE
 
@@ -185,10 +252,26 @@ def registered(root):
 
 
 def _write_marker(root, ext_id, version, folder):
-    _marker_path(root).write_text(json.dumps({'id': ext_id, 'version': version,
-                                              'folder': str(folder),
-                                              'deployed': time.strftime('%Y-%m-%dT%H:%M:%S')},
-                                             ensure_ascii=False), encoding='utf-8')
+    keep = marker(root)
+    data = {'id': ext_id, 'version': version, 'folder': str(folder),
+            'deployed': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    if isinstance(keep.get('autoRestart'), bool):
+        data['autoRestart'] = keep['autoRestart']
+    _marker_path(root).write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+
+def guard_enabled(root):
+    """Whether the watchdog may repair a browser that is already open."""
+    value = marker(Path(root)).get('autoRestart')
+    return True if not isinstance(value, bool) else value
+
+
+def set_guard_enabled(root, enabled):
+    root = Path(root)
+    data = marker(root)
+    data['autoRestart'] = bool(enabled)
+    _marker_path(root).write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    return data['autoRestart']
 
 
 def state(root):
@@ -197,9 +280,10 @@ def state(root):
     ext_id = folder_id(root / 'extension')
     data = marker(root)
     deployed = bool(data) and (root / 'extension' / 'manifest.json').is_file()
-    live = live_state(ext_id)
-    return {'installed': bool(deployed), 'enabled': bool(live and live['enabled']),
-            'id': ext_id, 'version': data.get('version', ''), 'running': edge_running()}
+    running = edge_running()
+    return {'installed': bool(deployed), 'enabled': bool(running and loaded_any(ext_id)),
+            'id': ext_id, 'version': data.get('version', ''), 'running': running,
+            'guard': guard_enabled(root)}
 
 
 def edge_running():
@@ -258,18 +342,92 @@ def _close_edge(grace=6, timeout=20):
 
 
 def _launch(extra=()):
+    """Start Edge detached, so it outlives this program and its process tree."""
     binary = edge_binary()
     if not binary:
         raise RuntimeError('未找到 Microsoft Edge。')
-    subprocess.Popen([str(binary), *extra], creationflags=_NO_WINDOW if os.name == 'nt' else 0)
+    flags = DETACHED if os.name == 'nt' else 0
+    subprocess.Popen([str(binary), *extra], creationflags=flags,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _guard['launch'] = time.time()
     return True
 
 
+def anchor(root, folder=None):
+    """Leave a windowless Edge running that already has the extension loaded."""
+    root = Path(root)
+    folder = Path(folder or root / 'extension')
+    if not (folder / 'manifest.json').is_file():
+        raise RuntimeError('扩展文件缺失，请重新安装本程序。')
+    if edge_running():
+        return {'started': False, 'reason': 'running'}
+    _launch([LOAD_FLAG + str(folder), ANCHOR_FLAG])
+    return {'started': True}
+
+
+def _await_live(ext_id, timeout=25):
+    """Edge writes the manifest entry a few seconds after the browser starts."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if loaded_any(ext_id):
+            return live_state(ext_id)
+        time.sleep(0.5)
+    return live_state(ext_id)
+
+
+def guard(root, folder=None):
+    """Keep the extension available for every Edge start.
+
+    Runs on a timer, so every branch is cheap and idempotent: an Edge that is
+    already carrying the extension is never touched, a closed Edge gets an
+    anchor, and an open Edge that lost the extension is restarted once (with
+    the previous session restored) before the watchdog backs off.
+    """
+    root = Path(root)
+    folder = Path(folder or root / 'extension')
+    if not registered(root):
+        return {'action': 'idle', 'reason': 'not-installed'}
+    ext_id = folder_id(folder)
+    running = edge_running()
+    if running and loaded_any(ext_id):
+        _guard['attempts'] = 0
+        return {'action': 'idle', 'reason': 'loaded'}
+    now = time.time()
+    if now < _guard['suspend']:
+        return {'action': 'idle', 'reason': 'suspended'}
+    if now - _guard['launch'] < 25:
+        return {'action': 'idle', 'reason': 'starting'}
+    if not running:
+        _launch([LOAD_FLAG + str(folder), ANCHOR_FLAG])
+        claimed = loaded_any(ext_id) or _await_live(ext_id, 25) is not None
+        if claimed:
+            _guard['attempts'] = 0
+            return {'action': 'anchored'}
+        _guard['attempts'] += 1
+        if _guard['attempts'] >= 3:
+            _guard['suspend'] = time.time() + 600
+        return {'action': 'anchor-failed'}
+    if not guard_enabled(root):
+        return {'action': 'idle', 'reason': 'auto-restart off'}
+    windows = visible_edge_windows()
+    _close_edge()
+    _launch([LOAD_FLAG + str(folder)] + ([RESTORE_FLAG] if windows else [ANCHOR_FLAG]))
+    applied = _await_live(ext_id, 25)
+    if applied and applied['enabled']:
+        _guard['attempts'] = 0
+        return {'action': 'restarted', 'windows': len(windows)}
+    _guard['attempts'] += 1
+    if _guard['attempts'] >= 3:
+        _guard['suspend'] = time.time() + 600
+    return {'action': 'restart-failed', 'windows': len(windows)}
+
+
 def deploy(root, folder=None, restart=True):
-    """Register the folder as an unpacked extension and (optionally) restart Edge.
+    """Make the extension available and report whether it is loaded now.
 
     `restart=False` never closes a browser the user is working in: the marker is
-    written and, when Edge happens to be closed, the flag is applied right away.
+    written and, when Edge happens to be closed, the anchor is left running so
+    the next launch already carries the extension.
     """
     root = Path(root)
     folder = Path(folder or root / 'extension')
@@ -278,56 +436,38 @@ def deploy(root, folder=None, restart=True):
     manifest = sync_manifest(folder, root)
     ext_id = identifier(base64.b64decode(manifest['key']))
     version = str(manifest.get('version', '1.0'))
-    live = live_state(ext_id)
-    if live and live['enabled']:
+    _write_marker(root, ext_id, version, folder)
+    running = edge_running()
+    if running and loaded_any(ext_id):
         # Already loaded: never bounce a browser for nothing.
-        _write_marker(root, ext_id, version, folder)
         return {'installed': True, 'enabled': True, 'id': ext_id, 'version': version,
                 'running': True, 'restarted': False}
-    was_running = edge_running()
-    if not was_running and not restart:
-        # Nothing to reuse and nothing to bounce: stay quiet so install does not
-        # pop a browser open by itself. `--load-extension` is a per-launch flag,
-        # so the settings row stays at "已安装，待启用" until the user clicks.
-        _write_marker(root, ext_id, version, folder)
-        return {'installed': True, 'enabled': bool(live and live['enabled']), 'id': ext_id,
-                'version': version, 'running': False, 'restarted': False, 'needsRestart': True}
-    if was_running:
-        _close_edge()
-    _launch([LOAD_FLAG + str(folder)])
-    _write_marker(root, ext_id, version, folder)
-    applied = _await_live(ext_id)
-    return {'installed': True, 'enabled': bool(applied and applied['enabled']),
-            'id': ext_id, 'version': version, 'running': True, 'restarted': was_running}
-
-
-def _await_live(ext_id, timeout=20):
-    """Edge writes the manifest entry a few seconds after the window appears."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        entry = live_state(ext_id)
-        if entry:
-            return entry
-        time.sleep(0.5)
-    return live_state(ext_id)
+    if not running:
+        _launch([LOAD_FLAG + str(folder), ANCHOR_FLAG])
+        applied = _await_live(ext_id, 25)
+        return {'installed': True, 'enabled': bool(applied and applied['enabled']), 'id': ext_id,
+                'version': version, 'running': edge_running(), 'restarted': False, 'anchored': True}
+    if not restart:
+        return {'installed': True, 'enabled': False, 'id': ext_id, 'version': version,
+                'running': True, 'restarted': False, 'needsRestart': True}
+    windows = visible_edge_windows()
+    _close_edge()
+    _launch([LOAD_FLAG + str(folder)] + ([RESTORE_FLAG] if windows else [ANCHOR_FLAG]))
+    applied = _await_live(ext_id, 25)
+    return {'installed': True, 'enabled': bool(applied and applied['enabled']), 'id': ext_id,
+            'version': version, 'running': edge_running(), 'restarted': bool(windows),
+            'anchored': not windows}
 
 
 def refresh(root, folder=None):
     """Re-apply after an app update, but never resurrect a removed extension.
 
-    Runs at every start, so it must not close a browser the user is using: an
-    extension Edge already knows about is left alone, and a missing one is only
-    applied while Edge is closed.
+    Runs at every start, so it must not close a browser the user is using.
     """
     root = Path(root)
     data = marker(root)
     if not data:
         return {'installed': False, 'enabled': False, 'id': '', 'version': '', 'running': edge_running()}
-    ext_id = folder_id(root / 'extension') or data.get('id', '')
-    live = live_state(ext_id)
-    if live and live['enabled']:
-        return {'installed': True, 'enabled': True, 'id': ext_id,
-                'version': live['version'] or data.get('version', ''), 'running': edge_running()}
     return deploy(root, folder, restart=False)
 
 
