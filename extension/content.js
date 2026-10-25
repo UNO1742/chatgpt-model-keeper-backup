@@ -97,48 +97,71 @@
     return names.slice(0,16);
   }
   // The levels a model really supports, in slider order. Read straight from the
-  // tick labels when they carry text; otherwise sweep the real slider once per
-  // model and remember the answer, so the card never offers a level the
-  // webpage would reject.
+  // tick labels when they carry text; otherwise sweep the real slider once and
+  // keep the answer on disk, so every later adjustment is a single move instead
+  // of another sweep the user has to watch.
   const effortCache=new Map();
+  let storedEfforts={},storeReady=null;
+  function readyStore() {
+    if(!storeReady) storeReady=(async()=>{
+      try {const got=await chrome.storage.local.get('efforts');storedEfforts=(got&&got.efforts)||{};} catch {}
+      return storedEfforts;
+    })();
+    return storeReady;
+  }
+  function rememberEfforts(key,list) {
+    effortCache.set(key,list);
+    if((storedEfforts[key]||[]).join('|')===list.join('|')) return;
+    storedEfforts={...storedEfforts,[key]:list};
+    try {chrome.storage.local.set({efforts:storedEfforts});} catch {}
+  }
   async function learnEfforts(key, step, getMenu) {
-    if(effortCache.has(key)) return effortCache.get(key);
+    await readyStore();
+    if(effortCache.has(key)) return {list:effortCache.get(key),from:null};
     let menu=await getMenu();
     const fromTicks=[...new Set([...menu.querySelectorAll('[class*="Tick-"]')]
       .map(e=>canonical(String(e.textContent||'').trim())).filter(Boolean))];
-    if(fromTicks.length>1) {effortCache.set(key,fromTicks);return fromTicks;}
-    let slider=menu.querySelector('[role="slider"]');
-    if(!slider || !unique(all('[data-reasoning-slider="true"]',menu))) return null;
-    const min=Number(slider.getAttribute('aria-valuemin')),max=Number(slider.getAttribute('aria-valuemax')),now=Number(slider.getAttribute('aria-valuenow'));
-    if(!Number.isFinite(min)||!Number.isFinite(max)||!Number.isFinite(now)||max<=min||max-min>8) return null;
+    if(fromTicks.length>1) {rememberEfforts(key,fromTicks);return {list:fromTicks,from:null};}
+    const slider=()=>menu.querySelector('[role="slider"]');
+    if(!slider() || !unique(all('[data-reasoning-slider="true"]',menu))) return {list:null,from:null};
+    const read=()=>{const s=slider();return s?[Number(s.getAttribute('aria-valuemin')),Number(s.getAttribute('aria-valuemax')),Number(s.getAttribute('aria-valuenow'))]:[NaN,NaN,NaN];};
+    const [min,max,wasAt]=read();
+    if(!Number.isFinite(min)||!Number.isFinite(max)||!Number.isFinite(wasAt)||max<=min||max-min>8) return {list:null,from:null};
+    const here=readEffort(menu),cached=storedEfforts[key];
+    // A remembered list is only trusted while the slider still has the same
+    // number of stops and the stop we are standing on still says the same thing.
+    if(cached && cached.length===max-min+1 && (!here||cached[wasAt-min]===here)) {
+      effortCache.set(key,cached);
+      return {list:cached,from:null};
+    }
     async function press(name) {
       await step(()=>{
         const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
         if(!keyboard) throw Error('思考强度滑块已关闭');
         keyboard.focus({preventScroll:true});
         keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));
-      });
+      },100);
       menu=await getMenu();
     }
+    // One pass only: down to the bottom, then read every stop on the way up.
+    for(let i=0;i<max-min;i++) await press('ArrowLeft');
     const seen=[];
     const take=()=>{const id=readEffort(menu);if(id&&!seen.includes(id))seen.push(id);};
-    for(let i=0;i<max-min;i++) await press('ArrowLeft');
-    seen.length=0;take();
+    take();
     for(let i=0;i<max-min;i++) {await press('ArrowRight');take();}
-    for(let i=0;i<max-now;i++) await press('ArrowLeft');
-    if(seen.length<2) return null;
-    effortCache.set(key,seen);
-    return seen;
+    if(seen.length<2) return {list:null,from:wasAt};
+    rememberEfforts(key,seen);
+    return {list:seen,from:wasAt};
   }
   async function enforce(preset, expectedMode) {
     const initialEpoch=epoch, url=location.href, initialFocus=document.activeElement;
-    let changed=false, previous='';
+    let previous='';
     const t=trigger();
     if(!t || t.disabled || t.getAttribute('aria-disabled')==='true') throw Error('未找到可用的模型按钮，请等待页面加载');
     function guard() {
       if(epoch!==initialEpoch || document.hidden || location.href!==url || mode()!==expectedMode || !t.isConnected || !visible(t)) throw Error('页面或用户操作发生变化，本轮已取消');
     }
-    async function step(fn) {guard();fn();await wait(220);guard();}
+    async function step(fn,ms=220) {guard();fn();await wait(ms);guard();}
     let opened=false;
     async function getMenu() {
       guard();
@@ -158,17 +181,16 @@
     }
     try {
       let menu=await getMenu();
-      let current=selectedModel(menu);
-      if(!current) throw Error('无法读取当前模型；停止操作');
+      const beforeModel=selectedModel(menu);
+      if(!beforeModel) throw Error('无法读取当前模型；停止操作');
       const beforeEffort=readEffort(menu);
-      previous=`${current} · ${labels[beforeEffort]?.[0]||'—'}`;
-      // What this page really offers, kept module-level so a failure below still
-      // reaches the card and stops it from offering an impossible level again.
-      const offers={models:harvestModels(menu),efforts:await learnEfforts(`${expectedMode}|${current}`,step,getMenu)};
-      pageLists={models:offers.models,efforts:offers.efforts||[],forModel:current,mode:expectedMode};
-      menu=await getMenu();
+      previous=`${beforeModel} · ${labels[beforeEffort]?.[0]||'—'}`;
+      // Decide "was this a correction?" from the page as the user left it. A
+      // learning sweep below moves the slider around, and that must never turn
+      // into a bubble about something the user did not do.
+      const changed=norm(beforeModel)!==norm(preset.model) || beforeEffort!==preset.effort;
+      let current=beforeModel, models=harvestModels(menu);
       if(norm(current)!==norm(preset.model)) {
-        changed=true;
         const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
         if(toggle) await step(()=>clickElement(toggle));
         menu=await getMenu();
@@ -179,46 +201,60 @@
         menu=await getMenu();
         current=selectedModel(menu);
         if(norm(current)!==norm(preset.model)) throw Error('模型变更未确认，可能受套餐或使用限额限制');
+        models=harvestModels(menu)||models;
       }
+      // The simple view holds the reasoning slider; the model list view does not.
+      if(!unique(all('[data-reasoning-slider="true"]',menu))) {
+        const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
+        if(toggle) await step(()=>clickElement(toggle));
+        menu=await getMenu();
+      }
+      // Learn the levels of the model we ended up on: a different model can offer
+      // a shorter slider, so this has to run after the switch, not before.
+      const known=await learnEfforts(`${expectedMode}|${current}`,step,getMenu);
+      menu=await getMenu();
+      // What this page really offers, kept module-level so a failure below still
+      // reaches the card and stops it from offering an impossible level again.
+      pageLists={models,efforts:known.list||[],forModel:current,mode:expectedMode};
       if(readEffort(menu)!==preset.effort) {
-        changed=true;
-        // If the model list remains open, toggle back into the simple slider view.
-        if(!unique(all('[data-reasoning-slider="true"]',menu))) {
-          const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
-          if(toggle) await step(()=>clickElement(toggle));
-          menu=await getMenu();
-        }
-        const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
         const slider=menu.querySelector('[role="slider"]');
-        if(!keyboard || !slider) throw Error('未找到思考强度滑块；网页结构可能已变化');
-        const min=Number(slider.getAttribute('aria-valuemin')), max=Number(slider.getAttribute('aria-valuemax'));
-        const original=Number(slider.getAttribute('aria-valuenow'));
-        if(!Number.isFinite(min)||!Number.isFinite(max)||!Number.isFinite(original)||max-min>12) throw Error('无法读取强度范围');
+        const min=Number(slider?.getAttribute('aria-valuemin')),max=Number(slider?.getAttribute('aria-valuemax'));
+        if(!unique(all('[data-reasoning-slider="true"]',menu)) || !Number.isFinite(min) || !Number.isFinite(max) || max-min>12) throw Error('未找到思考强度滑块；网页结构可能已变化');
         async function key(name) {
-          await step(()=>{keyboard.focus({preventScroll:true});keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));});
-        }
-        let found=false;
-        // Use the announced label, not the internal effort code: Chat's max can
-        // display Extra high while Work uses xhigh for the same visible label.
-        for(let i=0;i<=max-min;i++) await key('ArrowLeft');
-        for(let i=min;i<=max;i++) {
+          await step(()=>{
+            const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
+            if(!keyboard) throw Error('思考强度滑块已关闭');
+            keyboard.focus({preventScroll:true});
+            keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));
+          },130);
           menu=await getMenu();
-          if(readEffort(menu)===preset.effort) {found=true;break;}
-          if(i<max) await key('ArrowRight');
         }
-        if(!found) {
-          for(let i=0;i<=max-min;i++) await key('ArrowLeft');
-          for(let i=min;i<original;i++) await key('ArrowRight');
-          const only=(offers.efforts||[]).map(id=>labels[id]?.[0]||id).join(' / ');
+        // One direction only, straight to the stop. The old version walked down
+        // to the bottom and came back up looking for the label, which the user
+        // saw as the slider being dragged back and forth.
+        async function slide(value) {
+          const keyboard=menu.querySelector('[role="slider"]');
+          const at=Number(keyboard?.getAttribute('aria-valuenow'));
+          if(!Number.isFinite(at)||value===at) return;
+          const name=value>at?'ArrowRight':'ArrowLeft';
+          for(let i=0;i<Math.abs(value-at);i++) await key(name);
+        }
+        const list=known.list||[],target=list.indexOf(preset.effort);
+        if(target<0) {
+          // Nowhere to go: put the slider back where the sweep found it and say
+          // what this model actually offers instead of hunting for it.
+          if(known.from!==null) await slide(min+known.from);
+          const only=list.map(id=>labels[id]?.[0]||id).join(' / ');
           throw Error(`目标模型只支持 ${only||'其他强度'}，已恢复原强度`);
         }
+        await slide(min+target);
       }
       menu=await getMenu();
       if(norm(selectedModel(menu))!==norm(preset.model)||readEffort(menu)!==preset.effort) throw Error('设置未通过选中状态复核');
       // The full list is only visible in the model view, so refresh it from
       // whichever view is on screen now.
       const names=harvestModels(menu);
-      if(names.length) {offers.models=names;pageLists={...pageLists,models:names};}
+      if(names.length) {models=names;pageLists={...pageLists,models:names};}
       return {text:`${preset.model} · ${labels[preset.effort][0]}`,changed,previous};
     } finally {await close();}
   }

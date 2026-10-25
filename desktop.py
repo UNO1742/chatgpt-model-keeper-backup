@@ -55,6 +55,7 @@ class Bridge(QObject):
                     if owner.runtime_ready:self.send('runtimeReady')
             elif action=='hide':owner.close_panel()
             elif action=='panelHidden':owner.hidden_by_page()
+            elif action=='panelEntered':owner.reveal_panel()
             elif action=='toastDone':owner.toast.hide()
             elif action=='panelDragStart':owner.panel_drag=(QCursor.pos(),owner.panel.pos())
             elif action=='panelDragMove' and owner.panel_drag:
@@ -388,9 +389,16 @@ class Desktop(QObject):
         # Fill while the card is still transparent: it is already correct when
         # the enter animation starts, so nothing snaps into place mid-flight.
         if self.panel_ready:self.initial();self.status()
-        self.panel.setWindowOpacity(1.0)
+        # A hidden window keeps its last painted surface, and Windows hands that
+        # stale frame back the instant the window is shown again - a one-frame
+        # flash of the whole card before the entrance. Stay invisible until the
+        # page has really started its animation.
+        self.panel.setWindowOpacity(0.0)
         self.panel.show();self.panel.raise_()
         self.push_enter()
+        QTimer.singleShot(200,self.reveal_panel)
+    def reveal_panel(self):
+        if self.panel.isVisible():self.panel.setWindowOpacity(1.0)
     def push_enter(self):
         # The page may not exist yet on the very first open; the payload waits
         # for its "ready" and is delivered from there.
@@ -402,7 +410,12 @@ class Desktop(QObject):
     def close_panel(self,instant=False):
         if not self.panel.isVisible() or self.panel_closing:return
         if instant or not self.panel_ready:
-            self.panel.hide();return
+            self.panel.hide()
+            # The window is gone before the page could play its exit, so tell the
+            # page to drop the card back to its invisible start state. Otherwise
+            # the next open flashes a fully drawn card for a frame.
+            if self.panel_ready:self.bridge.send('panelReset')
+            return
         # The page plays the 150 ms exit and reports back; the fallback below
         # hides the window even if that message never arrives.
         self.panel_closing=True
@@ -410,6 +423,7 @@ class Desktop(QObject):
         QTimer.singleShot(320,self.hidden_by_page)
     def hidden_by_page(self):
         self.panel_closing=False;self.panel.hide()
+        if self.panel_ready:self.bridge.send('panelReset')
     def toggle_panel(self):
         if self.panel.isVisible():self.close_panel()
         else:self.open_panel()

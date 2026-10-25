@@ -31,7 +31,11 @@ function buildEfforts(mode,value){const items=efforts[mode],slider=$('#'+mode+'-
   if(sliderInstances[mode]){try{sliderInstances[mode].dispose();}catch{}delete sliderInstances[mode];delete sliderLoads[mode];}
   mountedStops[mode]=stops;
   sliderLoads[mode]=originalSlider.mount(slider,{options:items,selected:slider.dataset.effort,onChange:id=>renderEffort(mode,id)}).then(instance=>{sliderInstances[mode]=instance;instance.select(slider.dataset.effort);return instance;}).catch(error=>{notice('原始滑条加载失败：'+error.message);throw error;});}
-let listsKey='',baseModels={chat:[],work:[]},baseEfforts={chat:[],work:[]},pageLists={},effortLabels={},currentConfig=null;
+let listsKey='',baseModels={chat:[],work:[]},baseEfforts={chat:[],work:[]},pageLists={},effortLabels={},currentConfig=null,queuedLists=false;
+// One signature for "what the card is showing", so fill() and applyLists() can
+// never disagree about whether a rebuild is needed. Two different shapes here
+// meant every reopen rebuilt the menus and the slider for nothing.
+function listsSignature(list,config){return JSON.stringify([list,config?.chat?.model||'',config?.work?.model||'']);}
 function learnLabels(source){for(const mode of ['chat','work'])for(const pair of (source?.[mode]||[]))effortLabels[pair[0]]=pair;}
 // The card copies the page: when the extension reported the real model list and
 // thinking levels, those win over the built-in fallback. Levels are only taken
@@ -50,16 +54,16 @@ function resolveLists(config){
 }
 function renderLists(){
   const lists=resolveLists(currentConfig);
-  listsKey=JSON.stringify([lists,currentConfig?.chat?.model,currentConfig?.work?.model]);
+  listsKey=listsSignature(lists,currentConfig);
   models=lists.models;efforts=lists.efforts;
   for(const mode of ['chat','work']){const p=currentConfig?.[mode];if(!p)continue;$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}
 }
 function applyLists(lists){
   pageLists=lists||{};
   if(!currentConfig)return;
-  const next=resolveLists(currentConfig);
-  const key=JSON.stringify([next,currentConfig.chat.model,currentConfig.work.model]);
-  if(key===listsKey)return;
+  if(listsSignature(resolveLists(currentConfig),currentConfig)===listsKey)return;
+  // Never reshuffle the card while it is still flying in: that is the twitch.
+  if(panelAnim){queuedLists=true;return;}
   renderLists();
 }
 function fill(data){
@@ -75,7 +79,7 @@ function fill(data){
   if(data.lists)pageLists=data.lists;
   learnLabels(baseEfforts);
   const lists=resolveLists(currentConfig);
-  const key=JSON.stringify([data.version,lists,data.config.chat.model,data.config.work.model]);
+  const key=listsSignature(lists,data.config);
   if(key!==listsKey){
     listsKey=key;models=lists.models;efforts=lists.efforts;
     for(const mode of ['chat','work']){const p=data.config[mode];$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}
@@ -114,25 +118,55 @@ async function startOrb(){
 // transform-origin is the orb centre mapped into card coordinates, so the card
 // grows out of the ball whichever side it was placed on.
 let panelAnim=null,panelDir={x:0,y:-1},toastAnim=null,toastTimer=0,toastHover=false;
+// Finished Web Animations keep applying their last frame forever, so a card that
+// had been opened a few times carried a stack of them. Clearing the stack before
+// every run leaves exactly one animation in charge of the pixels.
+function clearCardAnimations(card){for(const a of card.getAnimations()){try{a.cancel();}catch{}}panelAnim=null;}
 function panelEnter(m){
   const card=$('#card'),origin=m.origin||{x:168,y:313},dir=m.dir||{x:0,y:-1};
   panelDir=dir;
+  clearCardAnimations(card);
+  card.classList.remove('on');
   card.style.transformOrigin=origin.x+'px '+origin.y+'px';
-  card.classList.add('on');
-  if(panelAnim)panelAnim.cancel();
   const dx=(-dir.x*16).toFixed(1),dy=(-dir.y*16).toFixed(1);
-  panelAnim=card.animate([{opacity:0,transform:`translate(${dx}px,${dy}px) scale(.9)`},{opacity:1,transform:'none'}],{duration:220,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});
-  panelAnim.onfinish=()=>{card.style.opacity='1';card.style.transform='none';panelAnim=null;};
+  let started=false;
+  const start=()=>{
+    if(started)return;started=true;
+    card.classList.add('on');
+    panelAnim=card.animate([{opacity:0,transform:`translate(${dx}px,${dy}px) scale(.9)`},{opacity:1,transform:'none'}],{duration:220,easing:'cubic-bezier(.22,1,.36,1)',fill:'both'});
+    panelAnim.onfinish=()=>{card.style.opacity='1';card.style.transform='none';panelAnim=null;if(queuedLists){queuedLists=false;renderLists();}};
+    // The shell keeps the window at zero alpha until this arrives, so the stale
+    // surface it was showing can never appear in front of the real card.
+    requestAnimationFrame(()=>requestAnimationFrame(()=>request('panelEntered')));
+  };
+  // Start after the window has composited its first frame. Beginning any
+  // earlier spends most of the 220 ms while the view is still waking up, so the
+  // card just pops in at full size - which reads as a flicker.
+  requestAnimationFrame(()=>requestAnimationFrame(start));
+  setTimeout(start,160);
   // Safety net: if the frame clock is throttled the card would stay at opacity
   // 0, i.e. an open window with nothing in it. Force the settled state.
-  setTimeout(()=>{if(card.style.opacity!=='1'){if(panelAnim)panelAnim.cancel();panelAnim=null;card.style.opacity='1';card.style.transform='none';}},450);
+  setTimeout(()=>{start();if(card.style.opacity!=='1'){clearCardAnimations(card);card.style.opacity='1';card.style.transform='none';}},520);
 }
 function panelExit(){
   const card=$('#card'),dir=panelDir;
-  if(panelAnim)panelAnim.cancel();
+  clearCardAnimations(card);
   const dx=(-dir.x*10).toFixed(1),dy=(-dir.y*10).toFixed(1);
   panelAnim=card.animate([{opacity:1,transform:'none'},{opacity:0,transform:`translate(${dx}px,${dy}px) scale(.96)`}],{duration:150,easing:'cubic-bezier(.4,0,1,1)',fill:'both'});
-  panelAnim.onfinish=()=>{panelAnim=null;card.classList.remove('on');card.style.opacity='';card.style.transform='';request('panelHidden');};
+  panelAnim.onfinish=()=>{
+    clearCardAnimations(card);card.classList.remove('on');card.style.opacity='';card.style.transform='';
+    // Let the now-empty frame reach the compositor before the window goes away;
+    // otherwise that last painted card is exactly what the next open flashes.
+    requestAnimationFrame(()=>request('panelHidden'));
+  };
+}
+function panelReset(){
+  // Called whenever the shell hides the window on its own (drag, watchdog), so
+  // the next open starts from a clean, invisible card instead of a finished
+  // animation that would flash the whole panel for a frame.
+  const card=$('#card');
+  clearCardAnimations(card);
+  card.classList.remove('on');card.style.opacity='';card.style.transform='';
 }
 function showToast(m){
   const root=$('#toast'),bubble=root.querySelector('.bubble');
@@ -178,6 +212,7 @@ new QWebChannel(qt.webChannelTransport,channel=>{
     if(m.type==='notice')notice(m.text);
     if(m.type==='panelEnter'&&isPanel)panelEnter(m);
     if(m.type==='panelExit'&&isPanel)panelExit();
+    if(m.type==='panelReset'&&isPanel)panelReset();
     if(m.type==='toast'&&isToast)showToast(m);
     if(m.type==='pulse'&&isOrb){const o=$('#orb');o.classList.remove('pulse');void o.offsetWidth;o.classList.add('pulse');}
     if(m.type==='release'&&isPanel){release=m.release;$('#update').disabled=false;$('#update-label').textContent=release.newer?'安装更新 '+release.tag:'已是最新版 · '+release.tag;notice(release.newer?'更新来自 GitHub Releases，下载后将校验 SHA-256。':'当前已是 GitHub 最新稳定版。');}
