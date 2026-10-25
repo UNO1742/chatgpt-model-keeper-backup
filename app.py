@@ -16,7 +16,7 @@ import winreg
 import extension_deploy
 
 HOST = 'local.chatgpt.modelkeeper'
-VERSION = '2.8.2'
+VERSION = '2.8.3'
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_VALUE = 'ChatGPTModelKeeper'
 def installation_root():

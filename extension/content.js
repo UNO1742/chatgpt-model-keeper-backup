@@ -101,10 +101,14 @@
   // keep the answer on disk, so every later adjustment is a single move instead
   // of another sweep the user has to watch.
   const effortCache=new Map();
-  let storedEfforts={},storeReady=null;
+  let storedEfforts={},triedEfforts={},storeReady=null;
   function readyStore() {
     if(!storeReady) storeReady=(async()=>{
-      try {const got=await chrome.storage.local.get('efforts');storedEfforts=(got&&got.efforts)||{};} catch {}
+      try {
+        const got=await chrome.storage.local.get(['efforts','effortTried']);
+        storedEfforts=(got&&got.efforts)||{};
+        triedEfforts=(got&&got.effortTried)||{};
+      } catch {}
       return storedEfforts;
     })();
     return storeReady;
@@ -114,6 +118,14 @@
     if((storedEfforts[key]||[]).join('|')===list.join('|')) return;
     storedEfforts={...storedEfforts,[key]:list};
     try {chrome.storage.local.set({efforts:storedEfforts});} catch {}
+  }
+  // Marks that the ladder of this model has already been walked once. The walk
+  // is the only way to see levels the page does not print, so it is allowed
+  // exactly once per model instead of on every single correction.
+  function markTried(key) {
+    if(triedEfforts[key]) return;
+    triedEfforts={...triedEfforts,[key]:1};
+    try {chrome.storage.local.set({effortTried:triedEfforts});} catch {}
   }
   // Some builds print the level names under the slider. Reading those costs no
   // movement at all, so it is always tried before the slider is touched.
@@ -208,51 +220,78 @@
       if(readEffort(menu)!==preset.effort) {
         const [min,max]=stops();
         if(!unique(all('[data-reasoning-slider="true"]',menu)) || !Number.isFinite(min) || max-min>12) throw Error('未找到思考强度滑块；网页结构可能已变化');
-        async function key(name) {
+        async function press(name,ms=130) {
           await step(()=>{
             const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
             if(!keyboard) throw Error('思考强度滑块已关闭');
             keyboard.focus({preventScroll:true});
             keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));
-          },130);
+          },ms);
           menu=await getMenu();
         }
         const value=()=>Number(menu.querySelector('[role="slider"]')?.getAttribute('aria-valuenow'));
         const order=Object.keys(labels), rank=id=>order.indexOf(String(id||''));
         const startAt=value(), startHere=readEffort(menu), count=max-min+1;
-        const seen=[];
-        const note=id=>{if(id&&!seen.includes(id))seen.push(id);};
-        note(startHere);
-        // One direction only, stopping at the target. Levels run in a fixed
-        // order, so the direction is known without knowing the exact list.
-        async function walk(dir) {
-          seen.length=0;
-          note(readEffort(menu));
+        let found=false, ladder=null;
+        if(!knownList() && !triedEfforts[key]) {
+          // First time this model's slider is seen and the page does not print
+          // its level names, so the ladder has to be walked once - there is no
+          // other way to see the stops. Start with the nearer end, cross the
+          // whole slider in one direction reading every stop, then come to the
+          // target from that end. One change of direction at most, once ever.
+          markTried(key);
+          const down=startAt-min<=max-startAt;
+          const first=down?'ArrowLeft':'ArrowRight', last=down?'ArrowRight':'ArrowLeft';
+          const side=[startHere];
           for(let i=0;i<count;i++) {
-            const at=value();
-            if(dir==='ArrowRight'?at>=max:at<=min) return false;
-            await key(dir);
-            const now=readEffort(menu);
-            note(now);
-            if(now===preset.effort) return true;
+            if(down?value()<=min:value()>=max) break;
+            await press(first,90);
+            const id=readEffort(menu);
+            if(id&&!side.includes(id)) side.push(id);
           }
-          return false;
+          const across=[];
+          for(let i=0;i<count;i++) {
+            if(down?value()>=max:value()<=min) break;
+            await press(last,90);
+            const id=readEffort(menu);
+            if(id&&!across.includes(id)) across.push(id);
+          }
+          // side runs away from the far end; across runs away from the near one,
+          // so a level on both sides of the turning point shows up twice.
+          const asc=[];
+          for(const id of (down?[...side].reverse().concat(across):[...across].reverse().concat(side))) if(!asc.includes(id)) asc.push(id);
+          if(asc.length===count) ladder=asc;
+          // We are on the far end now: step to the target, still one direction.
+          const back=last==='ArrowRight'?'ArrowLeft':'ArrowRight';
+          if(!ladder||ladder.includes(preset.effort)) {
+            for(let i=0;i<count;i++) {
+              if(readEffort(menu)===preset.effort) break;
+              if(back==='ArrowRight'?value()>=max:value()<=min) break;
+              await press(back,100);
+            }
+          }
+          found=readEffort(menu)===preset.effort;
+        } else {
+          // Levels run in a fixed order, so the direction is known without
+          // knowing the exact list: walk one stop at a time and stop there.
+          const dir=rank(preset.effort)>rank(startHere)?'ArrowRight':'ArrowLeft';
+          const back=dir==='ArrowRight'?'ArrowLeft':'ArrowRight';
+          for(let i=0;i<count&&!found;i++) {
+            if(dir==='ArrowRight'?value()>=max:value()<=min) break;
+            await press(dir);
+            if(readEffort(menu)===preset.effort) found=true;
+          }
+          if(!found) {
+            // Either this model lacks the level or the page orders its stops the
+            // other way round. Crossing once settles both and, if the page does
+            // print its names, hands back the real list.
+            for(let i=0;i<count&&!found;i++) {
+              if(back==='ArrowRight'?value()>=max:value()<=min) break;
+              await press(back);
+              if(readEffort(menu)===preset.effort) found=true;
+            }
+          }
         }
-        const up=rank(preset.effort)>rank(startHere);
-        let dir=up?'ArrowRight':'ArrowLeft', walkStart=startAt;
-        let found=await walk(dir);
-        if(!found) {
-          // Either this model lacks the level or the page orders its stops the
-          // other way round. Crossing the slider once settles both questions and
-          // returns the real list, so the card stops offering what cannot be set.
-          walkStart=value(), dir=up?'ArrowLeft':'ArrowRight';
-          found=await walk(dir);
-        }
-        // Only a pass that started on one end and reads every stop in a single
-        // direction is a trustworthy list; a partial window is not.
-        const complete=seen.length===count &&
-          ((dir==='ArrowRight'&&walkStart===min)||(dir==='ArrowLeft'&&walkStart===max));
-        const ladder=complete?(dir==='ArrowRight'?seen:[...seen].reverse()):null;
         if(ladder) {rememberEfforts(key,ladder);pageLists={...pageLists,efforts:ladder};}
         if(!found) {
           // Put the slider back where the user left it, one direction, and say
@@ -260,7 +299,7 @@
           for(let i=0;i<count;i++) {
             const at=value();
             if(!Number.isFinite(at)||at===startAt) break;
-            await key(at>startAt?'ArrowLeft':'ArrowRight');
+            await press(at>startAt?'ArrowLeft':'ArrowRight');
           }
           const list=ladder||knownList()||[];
           const only=list.map(id=>labels[id]?.[0]||id).join(' / ');
