@@ -18,9 +18,31 @@ function selectedModel(mode,value){const trigger=$('#'+mode+'-model');trigger.va
 function buildModels(mode,value){const menu=$('#'+mode+'-model-menu');const entries=[...models[mode]];if(value&&!entries.includes(value))entries.unshift(value);menu.replaceChildren(...entries.map(name=>{const option=document.createElement('button');option.type='button';option.className='model-option no-drag itemBase-Uk8vyp rounded-xl text-default group itemInteractive-A3p9wI flex flex-col';option.setAttribute('role','option');option.value=name;option.tabIndex=-1;const row=document.createElement('div');row.dataset.menuRowContent='true';row.className='flex w-full min-w-0 items-center gap-1.5';const label=document.createElement('span');label.className='flex-1 min-w-0 truncate';label.textContent=name;const check=document.createElement('span');check.className='check';check.setAttribute('aria-hidden','true');row.append(label,check);option.append(row);option.onclick=()=>{selectedModel(mode,name);closeMenus();$('#'+mode+'-model').focus();};return option;}));selectedModel(mode,value);}
 function openMenu(mode,keyboard=false){const trigger=$('#'+mode+'-model'),menu=$('#'+mode+'-model-menu');const wasOpen=!menu.hidden;closeMenus();if(wasOpen)return;trigger.setAttribute('aria-expanded','true');menu.hidden=false;if(keyboard)(menu.querySelector('[aria-selected=true]')||menu.firstElementChild)?.focus();}
 function renderEffort(mode,value){const slider=$('#'+mode+'-effort'),items=efforts[mode];let index=items.findIndex(item=>item[0]===value);if(index<0)index=items.length-1;const [id,label]=items[index];slider.dataset.effort=id;slider.setAttribute('aria-valuemin','0');slider.setAttribute('aria-valuemax',String(items.length-1));slider.setAttribute('aria-valuenow',String(index));slider.setAttribute('aria-valuetext',label);$('#'+mode+'-effort-label').textContent=label;$('#'+mode+'-rail-labels').querySelectorAll('button').forEach((b,i)=>b.setAttribute('aria-pressed',String(i===index)));}
-async function selectEffort(mode,value){renderEffort(mode,value);const instance=sliderInstances[mode]||await sliderLoads[mode];instance.select(value);}
+async function selectEffort(mode,value){renderEffort(mode,value);const instance=sliderInstances[mode]||await sliderLoads[mode];if(instance)instance.select(value);}
 function buildEfforts(mode,value){const items=efforts[mode],slider=$('#'+mode+'-effort');$('#'+mode+'-rail-labels').replaceChildren(...items.map(([id,label])=>{const button=document.createElement('button');button.textContent=label.split(' / ')[0];button.title=label;button.onclick=()=>{selectEffort(mode,id);slider.focus();};return button;}));renderEffort(mode,value);if(sliderInstances[mode]){sliderInstances[mode].select(slider.dataset.effort);return;}if(!sliderLoads[mode])sliderLoads[mode]=originalSlider.mount(slider,{options:items,selected:slider.dataset.effort,onChange:id=>renderEffort(mode,id)}).then(instance=>{sliderInstances[mode]=instance;instance.select(slider.dataset.effort);return instance;}).catch(error=>{notice('原始滑条加载失败：'+error.message);throw error;});}
-function fill(data){$('#version').textContent='v'+data.version;$('#enabled').checked=data.config.enabled;$('#startup').checked=data.startup;models=data.models;efforts=data.efforts;setTheme(data.theme||'dark');for(const mode of ['chat','work']){const p=data.config[mode];$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}}
+let listsKey='';
+function fill(data){
+  // Reopening the card must not rebuild identical model lists or remount the
+  // slider: that is what made the panel blink once on every open. Structural
+  // rebuild happens only when the lists or the selected model really change;
+  // plain values are re-applied silently (no visual change when already equal).
+  setTheme(data.theme||'dark');
+  $('#version').textContent='v'+data.version;$('#enabled').checked=data.config.enabled;$('#startup').checked=data.startup;
+  const key=JSON.stringify([data.version,data.models,data.efforts,data.config.chat.model,data.config.work.model]);
+  if(key!==listsKey){
+    listsKey=key;models=data.models;efforts=data.efforts;
+    for(const mode of ['chat','work']){const p=data.config[mode];$('#'+mode+'-enabled').checked=p.enabled;buildModels(mode,p.model);buildEfforts(mode,p.effort);}
+    return;
+  }
+  for(const mode of ['chat','work']){
+    const p=data.config[mode];
+    $('#'+mode+'-enabled').checked=p.enabled;
+    if($('#'+mode+'-model').value!==p.model)selectedModel(mode,p.model);
+    // Re-selecting the same effort replays the slider animation: that is the
+    // flicker on reopen, so only touch it when the saved value really differs.
+    if($('#'+mode+'-effort').dataset.effort!==p.effort)void selectEffort(mode,p.effort);
+  }
+}
 window.chooseMode=mode=>{closeMenus();$('.segments').classList.toggle('work',mode==='work');document.querySelectorAll('[data-mode]').forEach(b=>{const yes=b.dataset.mode===mode;b.classList.toggle('selected',yes);b.setAttribute('aria-selected',String(yes));});document.querySelectorAll('[data-pane]').forEach(p=>{const yes=p.dataset.pane===mode;p.classList.toggle('active',yes);p.inert=!yes;});};
 async function startOrb(){
   if(orbLoading||window.orbController)return;orbLoading=true;

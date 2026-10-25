@@ -41,22 +41,15 @@
     if(t && visible(document.querySelector('[aria-label="使用 ChatGPT Work"]'))) return 'work';
     return null; // Never guess a mode from the URL: both modes can use /c/…
   }
-  let badge, shadow, busy=false, lastInput=0, epoch=0, lastKey='', failures=0, retryAt=0, paused=false;
+  let busy=false, lastInput=0, epoch=0, lastKey='', failures=0, retryAt=0;
+  // No on-page widget: the page stays untouched, and every state goes to the
+  // desktop app, which owns the single "自动检测并调整" switch.
   let report={mode:'—',state:'等待',detail:'正在连接本机程序'};
-  function show(state,detail,m=mode()) {
-    report={mode:m==='chat'?'聊天':m==='work'?'工作':'未识别',state,detail};
-    if(!badge) {
-      badge=document.createElement('div'); badge.id='chatgpt-model-keeper';
-      badge.style.cssText='position:fixed;right:16px;bottom:16px;z-index:2147483600;max-width:370px';
-      shadow=badge.attachShadow({mode:'closed'});
-      shadow.innerHTML='<style>button{font:12px/1.5 system-ui,"Microsoft YaHei",sans-serif;color:#e7faf4;background:#123c38;border:1px solid #38796c;box-shadow:0 4px 20px #0003;border-radius:10px;padding:9px 13px;text-align:left;cursor:pointer;max-width:370px}button:focus{outline:2px solid #63d1b3}</style><button title="点击暂停 / 恢复当前标签页"></button>';
-      shadow.querySelector('button').onclick=()=>{paused=!paused; failures=0;retryAt=0;show(paused?'已暂停':'等待',paused?'点击此处恢复当前标签页':'即将重新检测');};
-      document.documentElement.appendChild(badge);
-    }
-    shadow.querySelector('button').textContent=`模型锁定器 · ${report.mode} · ${state}\n${detail}`;
+  function show(state,detail,m=mode(),extra) {
+    report={mode:m==='chat'?'聊天':m==='work'?'工作':'未识别',state,detail,...extra};
   }
   for(const event of ['pointerdown','keydown','input']) document.addEventListener(event,e=>{
-    if(e.isTrusted && !e.composedPath().includes(badge)) {lastInput=Date.now();epoch++;}
+    if(e.isTrusted) {lastInput=Date.now();epoch++;}
   },true);
   function ownMenu(t) {
     return unique(all('[role="menu"]').filter(e=>e.getAttribute('aria-labelledby')===t.id));
@@ -84,6 +77,7 @@
   }
   async function enforce(preset, expectedMode) {
     const initialEpoch=epoch, url=location.href, initialFocus=document.activeElement;
+    let changed=false, previous='';
     const t=trigger();
     if(!t || t.disabled || t.getAttribute('aria-disabled')==='true') throw Error('未找到可用的模型按钮，请等待页面加载');
     function guard() {
@@ -111,7 +105,10 @@
       let menu=await getMenu();
       let current=selectedModel(menu);
       if(!current) throw Error('无法读取当前模型；停止操作');
+      const beforeEffort=readEffort(menu);
+      previous=`${current} · ${labels[beforeEffort]?.[0]||'—'}`;
       if(norm(current)!==norm(preset.model)) {
+        changed=true;
         const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
         if(toggle) await step(()=>clickElement(toggle));
         menu=await getMenu();
@@ -124,6 +121,7 @@
         if(norm(current)!==norm(preset.model)) throw Error('模型变更未确认，可能受套餐或使用限额限制');
       }
       if(readEffort(menu)!==preset.effort) {
+        changed=true;
         // If the model list remains open, toggle back into the simple slider view.
         if(!unique(all('[data-reasoning-slider="true"]',menu))) {
           const toggle=unique(all('[data-model-picker-view-toggle="true"]',menu));
@@ -156,7 +154,7 @@
       }
       menu=await getMenu();
       if(norm(selectedModel(menu))!==norm(preset.model)||readEffort(menu)!==preset.effort) throw Error('设置未通过选中状态复核');
-      return `${preset.model} · ${labels[preset.effort][0]}`;
+      return {text:`${preset.model} · ${labels[preset.effort][0]}`,changed,previous};
     } finally {await close();}
   }
   let confirmed=null, lastAudit=0;
@@ -171,8 +169,8 @@
       const cfg=response.config, m=mode();
       const k=location.href+'|'+m+'|'+JSON.stringify(cfg);
       if(k!==lastKey) {lastKey=k;failures=0;retryAt=0;confirmed=null;}
-      if(paused) {show('已暂停','点击此处恢复当前标签页',m);return;}
-      if(!cfg.enabled || (m && !cfg[m]?.enabled)) {show('已暂停','此预设已在设置程序中停用',m);return;}
+      if(!cfg.enabled) {show('已暂停','设置程序已关闭“自动检测并调整”',m);return;}
+      if(m && !cfg[m]?.enabled) {show('已暂停',`设置程序已关闭“应用${m==='chat'?'聊天':'工作'}预设”`,m);return;}
       if(!m) {show('等待','无法确认聊天 / 工作模式；为避免误改暂不操作');return;}
       if(failures>=3) {show('需要检查','连续三次失败，已停止重试。点击两次状态提示，或用扩展按钮重新检测',m);return;}
       if(Date.now()<retryAt || Date.now()-lastInput<1800) return;
@@ -186,14 +184,15 @@
       if(confirmed?.node===t && confirmed.stamp===stamp && Date.now()-lastAudit<60000) return;
       const result=await enforce(cfg[m],m);
       confirmed={node:trigger(),stamp:trigger()?.getAttribute('data-selected-reasoning-effort')+'|'+trigger()?.textContent};
-      lastAudit=Date.now();failures=0;show('已确认',result,m);
+      lastAudit=Date.now();failures=0;
+      show('已确认',result.text,m,result.changed?{changed:true,previous:result.previous,applied:result.text}:undefined);
     } catch(e) {
-      if(/本轮已取消/.test(e.message)) {confirmed=null;retryAt=Date.now()+3000;show('等待','检测被用户操作或页面切换打断，稍后重试');}
-      else {failures++;retryAt=Date.now()+30000;show('无法调整',e.message);}
+      if(/本轮已取消/.test(e.message)) {confirmed=null;retryAt=Date.now()+3000;show('等待','被你的操作或页面切换打断，3 秒后自动重试');}
+      else {failures++;retryAt=Date.now()+30000;show('无法调整',`${e.message} · 第 ${failures}/3 次失败，30 秒后重试`);}
     } finally {busy=false;}
   }
   chrome.runtime.onMessage.addListener((m,s,reply)=>{
-    if(m.type==='retry') {failures=0;retryAt=0;paused=false;confirmed=null;lastInput=0;reply({ok:true});void tick();}
+    if(m.type==='retry') {failures=0;retryAt=0;confirmed=null;lastInput=0;reply({ok:true});void tick();}
   });
   show('等待','正在连接本机程序');
   setInterval(()=>void tick(),3000);

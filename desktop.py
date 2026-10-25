@@ -275,8 +275,22 @@ class Desktop(QObject):
         if self.panel.isVisible():self.panel.hide();return
         area=self.application.primaryScreen().availableGeometry();x=self.orb.x()-280;y=self.orb.y()-655
         x=max(area.left(),min(x,area.right()-360));y=max(area.top(),min(y,area.bottom()-650))
-        self.panel.move(x,y);self.panel.show();self.panel.raise_()
+        self.panel.move(x,y)
+        # Refresh while hidden: the card is already filled when the first frame is
+        # composited, so opening never shows stale values snapping into place.
         if self.panel_ready:self.initial();self.status()
+        self.panel.setWindowOpacity(0.0)
+        self.panel.show();self.panel.raise_()
+        self.fade_panel(1)
+    FADE=(0.2,0.45,0.7,0.9,1.0)
+    def fade_panel(self,step):
+        # A frameless translucent QWebEngineView can present one unstyled frame
+        # when it is mapped. Mapping it fully transparent and ramping opacity in
+        # ~65 ms hides that frame instead of letting it flash.
+        if not self.panel.isVisible():
+            self.panel.setWindowOpacity(1.0);return
+        self.panel.setWindowOpacity(self.FADE[step-1])
+        if step<len(self.FADE):QTimer.singleShot(16,partial(self.fade_panel,step+1))
     def context(self):
         light=api.load_appearance()['theme']=='light'
         menu=QMenu();menu.setStyleSheet('QMenu{background:'+('#fff;color:#171717' if light else '#202020;color:#eee')+';border:1px solid #777;border-radius:10px;padding:7px} QMenu::item{padding:8px 15px} QMenu::item:selected{background:'+('#e9e9e9' if light else '#3a3a3a')+'}')
