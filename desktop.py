@@ -368,7 +368,7 @@ class Desktop(QObject):
         if payload and self.panel_ready and self.panel.isVisible():
             self.panel_enter=None
             self.bridge.send('panelEnter',**payload)
-            self.orb.bridge.send('pulse')
+            self.bridge.send('pulse')  # broadcast; only the orb view reacts
     def close_panel(self,instant=False):
         if not self.panel.isVisible() or self.panel_closing:return
         if instant or not self.panel_ready:
