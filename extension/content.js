@@ -115,43 +115,12 @@
     storedEfforts={...storedEfforts,[key]:list};
     try {chrome.storage.local.set({efforts:storedEfforts});} catch {}
   }
-  async function learnEfforts(key, step, getMenu) {
-    await readyStore();
-    if(effortCache.has(key)) return {list:effortCache.get(key),from:null};
-    let menu=await getMenu();
+  // Some builds print the level names under the slider. Reading those costs no
+  // movement at all, so it is always tried before the slider is touched.
+  function tickEfforts(menu) {
     const fromTicks=[...new Set([...menu.querySelectorAll('[class*="Tick-"]')]
       .map(e=>canonical(String(e.textContent||'').trim())).filter(Boolean))];
-    if(fromTicks.length>1) {rememberEfforts(key,fromTicks);return {list:fromTicks,from:null};}
-    const slider=()=>menu.querySelector('[role="slider"]');
-    if(!slider() || !unique(all('[data-reasoning-slider="true"]',menu))) return {list:null,from:null};
-    const read=()=>{const s=slider();return s?[Number(s.getAttribute('aria-valuemin')),Number(s.getAttribute('aria-valuemax')),Number(s.getAttribute('aria-valuenow'))]:[NaN,NaN,NaN];};
-    const [min,max,wasAt]=read();
-    if(!Number.isFinite(min)||!Number.isFinite(max)||!Number.isFinite(wasAt)||max<=min||max-min>8) return {list:null,from:null};
-    const here=readEffort(menu),cached=storedEfforts[key];
-    // A remembered list is only trusted while the slider still has the same
-    // number of stops and the stop we are standing on still says the same thing.
-    if(cached && cached.length===max-min+1 && (!here||cached[wasAt-min]===here)) {
-      effortCache.set(key,cached);
-      return {list:cached,from:null};
-    }
-    async function press(name) {
-      await step(()=>{
-        const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
-        if(!keyboard) throw Error('思考强度滑块已关闭');
-        keyboard.focus({preventScroll:true});
-        keyboard.dispatchEvent(new KeyboardEvent('keydown',{key:name,code:name,bubbles:true,cancelable:true}));
-      },100);
-      menu=await getMenu();
-    }
-    // One pass only: down to the bottom, then read every stop on the way up.
-    for(let i=0;i<max-min;i++) await press('ArrowLeft');
-    const seen=[];
-    const take=()=>{const id=readEffort(menu);if(id&&!seen.includes(id))seen.push(id);};
-    take();
-    for(let i=0;i<max-min;i++) {await press('ArrowRight');take();}
-    if(seen.length<2) return {list:null,from:wasAt};
-    rememberEfforts(key,seen);
-    return {list:seen,from:wasAt};
+    return fromTicks.length>1?fromTicks:null;
   }
   async function enforce(preset, expectedMode) {
     const initialEpoch=epoch, url=location.href, initialFocus=document.activeElement;
@@ -209,17 +178,36 @@
         if(toggle) await step(()=>clickElement(toggle));
         menu=await getMenu();
       }
-      // Learn the levels of the model we ended up on: a different model can offer
-      // a shorter slider, so this has to run after the switch, not before.
-      const known=await learnEfforts(`${expectedMode}|${current}`,step,getMenu);
-      menu=await getMenu();
+      // The levels of the model we ended up on. A different model can offer a
+      // shorter slider, so this is read after the switch, not before.
+      const key=`${expectedMode}|${current}`;
+      await readyStore();
+      const stops=()=>{
+        const s=menu.querySelector('[role="slider"]');
+        const min=Number(s?.getAttribute('aria-valuemin')),max=Number(s?.getAttribute('aria-valuemax'));
+        return Number.isFinite(min)&&Number.isFinite(max)&&max>min?[min,max]:[NaN,NaN];
+      };
+      // A remembered list is only trusted while the slider still has the same
+      // number of stops and the stop we are standing on still says the same
+      // thing. Reading it moves nothing.
+      const knownList=()=>{
+        const [min,max]=stops();
+        if(!Number.isFinite(min)) return null;
+        const ticks=tickEfforts(menu);
+        if(ticks&&ticks.length===max-min+1) {rememberEfforts(key,ticks);return ticks;}
+        const list=storedEfforts[key];
+        if(!list) return null;
+        if(list.length!==max-min+1) return null;
+        const at=Number(menu.querySelector('[role="slider"]')?.getAttribute('aria-valuenow')),here=readEffort(menu);
+        if(here&&Number.isFinite(at)&&list[at-min]!==here) return null;
+        return list;
+      };
       // What this page really offers, kept module-level so a failure below still
       // reaches the card and stops it from offering an impossible level again.
-      pageLists={models,efforts:known.list||[],forModel:current,mode:expectedMode};
+      pageLists={models,efforts:knownList()||[],forModel:current,mode:expectedMode};
       if(readEffort(menu)!==preset.effort) {
-        const slider=menu.querySelector('[role="slider"]');
-        const min=Number(slider?.getAttribute('aria-valuemin')),max=Number(slider?.getAttribute('aria-valuemax'));
-        if(!unique(all('[data-reasoning-slider="true"]',menu)) || !Number.isFinite(min) || !Number.isFinite(max) || max-min>12) throw Error('未找到思考强度滑块；网页结构可能已变化');
+        const [min,max]=stops();
+        if(!unique(all('[data-reasoning-slider="true"]',menu)) || !Number.isFinite(min) || max-min>12) throw Error('未找到思考强度滑块；网页结构可能已变化');
         async function key(name) {
           await step(()=>{
             const keyboard=unique(all('[data-reasoning-slider="true"]',menu));
@@ -229,25 +217,55 @@
           },130);
           menu=await getMenu();
         }
-        // One direction only, straight to the stop. The old version walked down
-        // to the bottom and came back up looking for the label, which the user
-        // saw as the slider being dragged back and forth.
-        async function slide(value) {
-          const keyboard=menu.querySelector('[role="slider"]');
-          const at=Number(keyboard?.getAttribute('aria-valuenow'));
-          if(!Number.isFinite(at)||value===at) return;
-          const name=value>at?'ArrowRight':'ArrowLeft';
-          for(let i=0;i<Math.abs(value-at);i++) await key(name);
+        const value=()=>Number(menu.querySelector('[role="slider"]')?.getAttribute('aria-valuenow'));
+        const order=Object.keys(labels), rank=id=>order.indexOf(String(id||''));
+        const startAt=value(), startHere=readEffort(menu), count=max-min+1;
+        const seen=[];
+        const note=id=>{if(id&&!seen.includes(id))seen.push(id);};
+        note(startHere);
+        // One direction only, stopping at the target. Levels run in a fixed
+        // order, so the direction is known without knowing the exact list.
+        async function walk(dir) {
+          seen.length=0;
+          note(readEffort(menu));
+          for(let i=0;i<count;i++) {
+            const at=value();
+            if(dir==='ArrowRight'?at>=max:at<=min) return false;
+            await key(dir);
+            const now=readEffort(menu);
+            note(now);
+            if(now===preset.effort) return true;
+          }
+          return false;
         }
-        const list=known.list||[],target=list.indexOf(preset.effort);
-        if(target<0) {
-          // Nowhere to go: put the slider back where the sweep found it and say
-          // what this model actually offers instead of hunting for it.
-          if(known.from!==null) await slide(min+known.from);
+        const up=rank(preset.effort)>rank(startHere);
+        let dir=up?'ArrowRight':'ArrowLeft', walkStart=startAt;
+        let found=await walk(dir);
+        if(!found) {
+          // Either this model lacks the level or the page orders its stops the
+          // other way round. Crossing the slider once settles both questions and
+          // returns the real list, so the card stops offering what cannot be set.
+          walkStart=value(), dir=up?'ArrowLeft':'ArrowRight';
+          found=await walk(dir);
+        }
+        // Only a pass that started on one end and reads every stop in a single
+        // direction is a trustworthy list; a partial window is not.
+        const complete=seen.length===count &&
+          ((dir==='ArrowRight'&&walkStart===min)||(dir==='ArrowLeft'&&walkStart===max));
+        const ladder=complete?(dir==='ArrowRight'?seen:[...seen].reverse()):null;
+        if(ladder) {rememberEfforts(key,ladder);pageLists={...pageLists,efforts:ladder};}
+        if(!found) {
+          // Put the slider back where the user left it, one direction, and say
+          // what this model actually offers.
+          for(let i=0;i<count;i++) {
+            const at=value();
+            if(!Number.isFinite(at)||at===startAt) break;
+            await key(at>startAt?'ArrowLeft':'ArrowRight');
+          }
+          const list=ladder||knownList()||[];
           const only=list.map(id=>labels[id]?.[0]||id).join(' / ');
           throw Error(`目标模型只支持 ${only||'其他强度'}，已恢复原强度`);
         }
-        await slide(min+target);
       }
       menu=await getMenu();
       if(norm(selectedModel(menu))!==norm(preset.model)||readEffort(menu)!==preset.effort) throw Error('设置未通过选中状态复核');
