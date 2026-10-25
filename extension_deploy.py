@@ -31,12 +31,14 @@ manifest and decides the extension ID, so no signing secret ships with the app
 and every machine gets a stable, predictable ID.
 """
 import base64
+import ctypes
 import hashlib
 import json
 import os
 import subprocess
 import time
 import winreg
+from ctypes import wintypes
 from pathlib import Path
 
 KEY_FILE = 'extension_key.json'
@@ -201,6 +203,112 @@ def loaded_any(ext_id):
     return False
 
 
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [('Length', wintypes.USHORT), ('MaximumLength', wintypes.USHORT),
+                ('Buffer', ctypes.c_void_p)]
+
+
+class _ProcessBasicInformation(ctypes.Structure):
+    _fields_ = [('Reserved1', ctypes.c_void_p), ('PebBaseAddress', ctypes.c_void_p),
+                ('Reserved2_0', ctypes.c_void_p), ('Reserved2_1', ctypes.c_void_p),
+                ('UniqueProcessId', ctypes.c_void_p), ('Reserved3', ctypes.c_void_p)]
+
+
+class _ProcessEntry(ctypes.Structure):
+    _fields_ = [('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+                ('th32ProcessID', wintypes.DWORD), ('th32DefaultHeapID', ctypes.c_size_t),
+                ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+                ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', ctypes.c_long),
+                ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260)]
+
+
+def _process_ids(name):
+    if os.name != 'nt':
+        return []
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if snapshot in (0, -1):
+        return []
+    found = []
+    try:
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry)
+        alive = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while alive:
+            if entry.szExeFile.lower() == name.lower():
+                found.append(int(entry.th32ProcessID))
+            alive = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return found
+
+
+def _command_line(pid):
+    """Full command line of a process, read from its PEB.
+
+    `wmic` no longer exists on current Windows and a PowerShell CIM query costs
+    about a second, which is too slow for an 8 s watchdog.
+    """
+    if os.name != 'nt':
+        return None
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    ntdll = ctypes.WinDLL('ntdll')
+    handle = kernel32.OpenProcess(0x1000 | 0x0010, False, pid)   # QUERY_LIMITED + VM_READ
+    if not handle:
+        return None
+
+    def read(address, size):
+        buffer = ctypes.create_string_buffer(size)
+        got = ctypes.c_size_t()
+        if not kernel32.ReadProcessMemory(handle, ctypes.c_void_p(address), buffer, size,
+                                          ctypes.byref(got)):
+            return None
+        return buffer.raw[:got.value]
+
+    try:
+        info = _ProcessBasicInformation()
+        size = ctypes.c_ulong()
+        if ntdll.NtQueryInformationProcess(handle, 0, ctypes.byref(info),
+                                           ctypes.sizeof(info), ctypes.byref(size)) != 0:
+            return None
+        if not info.PebBaseAddress:
+            return None
+        peb = read(info.PebBaseAddress, 0x40)
+        if not peb:
+            return None
+        # x64 PEB->ProcessParameters at 0x20, CommandLine (UNICODE_STRING) at 0x70.
+        parameters = int.from_bytes(peb[0x20:0x28], 'little')
+        if not parameters:
+            return None
+        block = read(parameters, 0x100)
+        if not block:
+            return None
+        text = _UnicodeString.from_buffer_copy(block[0x70:0x80])
+        if not text.Length or not text.Buffer:
+            return None
+        raw = read(text.Buffer, text.Length)
+        return raw.decode('utf-16-le', 'replace') if raw else None
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def session_carrying(folder):
+    """True when a running Edge process was started with our --load-extension.
+
+    This is the only trustworthy answer: Chromium leaves the profile entry of a
+    command-line extension behind after the browser exits, so `Secure
+    Preferences` can look loaded while nothing is running - which is exactly
+    what made the settings card claim success on a browser without the
+    extension.
+    """
+    target = str(Path(folder)).lower()
+    for pid in _process_ids('msedge.exe'):
+        line = (_command_line(pid) or '').lower()
+        if LOAD_FLAG in line and target in line:
+            return True
+    return False
+
+
 def visible_edge_windows():
     """Titles of Edge windows the user can actually see."""
     if os.name != 'nt':
@@ -277,11 +385,12 @@ def set_guard_enabled(root, enabled):
 def state(root):
     """What the settings card needs to render install / uninstall."""
     root = Path(root)
-    ext_id = folder_id(root / 'extension')
+    folder = root / 'extension'
+    ext_id = folder_id(folder)
     data = marker(root)
-    deployed = bool(data) and (root / 'extension' / 'manifest.json').is_file()
+    deployed = bool(data) and (folder / 'manifest.json').is_file()
     running = edge_running()
-    return {'installed': bool(deployed), 'enabled': bool(running and loaded_any(ext_id)),
+    return {'installed': bool(deployed), 'enabled': bool(running and session_carrying(folder)),
             'id': ext_id, 'version': data.get('version', ''), 'running': running,
             'guard': guard_enabled(root)}
 
@@ -365,14 +474,14 @@ def anchor(root, folder=None):
     return {'started': True}
 
 
-def _await_live(ext_id, timeout=25):
-    """Edge writes the manifest entry a few seconds after the browser starts."""
+def _await_carrying(folder, timeout=25):
+    """A fresh Edge needs a few seconds before its command line shows up."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if loaded_any(ext_id):
-            return live_state(ext_id)
+        if session_carrying(folder):
+            return True
         time.sleep(0.5)
-    return live_state(ext_id)
+    return session_carrying(folder)
 
 
 def guard(root, folder=None):
@@ -387,9 +496,8 @@ def guard(root, folder=None):
     folder = Path(folder or root / 'extension')
     if not registered(root):
         return {'action': 'idle', 'reason': 'not-installed'}
-    ext_id = folder_id(folder)
     running = edge_running()
-    if running and loaded_any(ext_id):
+    if running and session_carrying(folder):
         _guard['attempts'] = 0
         return {'action': 'idle', 'reason': 'loaded'}
     now = time.time()
@@ -399,8 +507,7 @@ def guard(root, folder=None):
         return {'action': 'idle', 'reason': 'starting'}
     if not running:
         _launch([LOAD_FLAG + str(folder), ANCHOR_FLAG])
-        claimed = loaded_any(ext_id) or _await_live(ext_id, 25) is not None
-        if claimed:
+        if _await_carrying(folder):
             _guard['attempts'] = 0
             return {'action': 'anchored'}
         _guard['attempts'] += 1
@@ -412,8 +519,7 @@ def guard(root, folder=None):
     windows = visible_edge_windows()
     _close_edge()
     _launch([LOAD_FLAG + str(folder)] + ([RESTORE_FLAG] if windows else [ANCHOR_FLAG]))
-    applied = _await_live(ext_id, 25)
-    if applied and applied['enabled']:
+    if _await_carrying(folder):
         _guard['attempts'] = 0
         return {'action': 'restarted', 'windows': len(windows)}
     _guard['attempts'] += 1
@@ -438,14 +544,14 @@ def deploy(root, folder=None, restart=True):
     version = str(manifest.get('version', '1.0'))
     _write_marker(root, ext_id, version, folder)
     running = edge_running()
-    if running and loaded_any(ext_id):
+    if running and session_carrying(folder):
         # Already loaded: never bounce a browser for nothing.
         return {'installed': True, 'enabled': True, 'id': ext_id, 'version': version,
                 'running': True, 'restarted': False}
     if not running:
         _launch([LOAD_FLAG + str(folder), ANCHOR_FLAG])
-        applied = _await_live(ext_id, 25)
-        return {'installed': True, 'enabled': bool(applied and applied['enabled']), 'id': ext_id,
+        carried = _await_carrying(folder)
+        return {'installed': True, 'enabled': bool(carried), 'id': ext_id,
                 'version': version, 'running': edge_running(), 'restarted': False, 'anchored': True}
     if not restart:
         return {'installed': True, 'enabled': False, 'id': ext_id, 'version': version,
@@ -453,8 +559,8 @@ def deploy(root, folder=None, restart=True):
     windows = visible_edge_windows()
     _close_edge()
     _launch([LOAD_FLAG + str(folder)] + ([RESTORE_FLAG] if windows else [ANCHOR_FLAG]))
-    applied = _await_live(ext_id, 25)
-    return {'installed': True, 'enabled': bool(applied and applied['enabled']), 'id': ext_id,
+    carried = _await_carrying(folder)
+    return {'installed': True, 'enabled': bool(carried), 'id': ext_id,
             'version': version, 'running': edge_running(), 'restarted': bool(windows),
             'anchored': not windows}
 

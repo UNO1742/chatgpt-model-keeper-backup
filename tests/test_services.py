@@ -102,6 +102,8 @@ class Services(unittest.TestCase):
             deploy.set_guard_enabled(root,True)
             self.assertTrue(deploy.guard_enabled(root))
             self.assertIsInstance(deploy.visible_edge_windows(),list)
+            # A folder no Edge process was started with must never look loaded.
+            self.assertFalse(deploy.session_carrying(root/'extension'))
             self.assertEqual(deploy.guard(Path(directory)),{'action':'idle','reason':'not-installed'})
     def test_extension_origins_dedupe_installed_and_bundled_keys(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(app,'ROOT',Path(directory)):
