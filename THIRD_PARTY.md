@@ -11,14 +11,15 @@ Chromium licensing: https://www.chromium.org/chromium-os/licensing/ .
 
 The Horizon orb renderer, watercolor texture, original ChatGPT UI stylesheet
 OpenAI Sans fonts, original PowerSlider component and its original runtime
-dependency bundles are **not** part of this
-repository or release payload and are **not** covered by this project's MIT
-license. At first use, the application retrieves the public resources identified
-in `runtime_manifest.json` directly from their original ChatGPT CDN, verifies
-their pinned SHA-256 digests and caches them locally. No OpenAI authentication,
-cookies or conversation content are used. Availability and rights in these
-resources remain with their respective owner. This project is not affiliated
-with OpenAI.
+dependency bundles are **not** covered by this project's MIT license, and all
+rights in them remain with their respective owner. They are redistributed
+unmodified, pinned by the SHA-256 digests in `runtime_manifest.json`, under
+`runtime_seed/` in this repository and inside the release payload, so that a
+first launch needs no network access. The application copies them from the
+installed payload and re-verifies every digest; only if a packed copy fails
+verification does it retrieve the same file from its original ChatGPT CDN. No
+OpenAI authentication, cookies or conversation content are used. This project
+is not affiliated with OpenAI.
 
 The power slider executes the original component function and its original
 React/Radix/Motion dependencies. A narrowly scoped export shim exposes its

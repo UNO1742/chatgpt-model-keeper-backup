@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 python -m PyInstaller --clean --noconfirm --onefile --windowed --name ModelKeeperHost --exclude-module desktop --exclude-module floating --exclude-module PySide6 --add-data 'extension;extension' native_host.py
 if ($LASTEXITCODE -ne 0) { throw 'Native host build failed' }
-python -m PyInstaller --clean --noconfirm --onedir --windowed --name ModelKeeper --exclude-module tkinter --exclude-module floating --exclude-module numpy --exclude-module PIL --add-data 'extension;extension' --add-data 'desktop_ui;desktop_ui' --add-data 'runtime_manifest.json;.' app.py
+python -m PyInstaller --clean --noconfirm --onedir --windowed --name ModelKeeper --exclude-module tkinter --exclude-module floating --exclude-module numpy --exclude-module PIL --add-data 'extension;extension' --add-data 'desktop_ui;desktop_ui' --add-data 'runtime_manifest.json;.' --add-data 'runtime_seed;runtime_seed' app.py
 if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }
 # Qt 6.12 uses the stable Windows ICU API. PyInstaller can collect an
 # unrelated ICU 78 from PATH, whose versioned exports shadow System32 ICU.

@@ -1,0 +1,4 @@
+# Pinned rendering resources must keep their exact bytes: the SHA-256 digests in
+# runtime_manifest.json are verified at startup, and any end-of-line rewrite
+# would invalidate them (core.autocrlf is on for this checkout).
+runtime_seed/** -text

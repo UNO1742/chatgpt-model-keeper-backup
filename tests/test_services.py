@@ -43,6 +43,26 @@ class Services(unittest.TestCase):
             (assets/'runtime_manifest.json').write_text(json.dumps(manifest))
             with patch('urllib.request.urlopen',return_value=Response(body)) as fetch:
                 ensure_runtime(base,assets);ensure_runtime(base,assets);self.assertEqual(fetch.call_count,1)
+    def test_runtime_cache_uses_packed_copy_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);assets=base/'assets';assets.mkdir();body=b'renderer'
+            manifest={'files':[{'path':'component/a.mjs','url':'https://chatgpt.com/cdn/test.js','size':len(body),'sha256':hashlib.sha256(body).hexdigest()}]}
+            (assets/'runtime_manifest.json').write_text(json.dumps(manifest))
+            seed=assets/'runtime_seed'/'component';seed.mkdir(parents=True)
+            (seed/'a.mjs').write_bytes(body)
+            with patch('urllib.request.urlopen',side_effect=AssertionError('packed copy must be used')):
+                ensure_runtime(base,assets)
+            self.assertEqual((base/'runtime'/'component'/'a.mjs').read_bytes(),body)
+    def test_runtime_cache_ignores_damaged_packed_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory);assets=base/'assets';assets.mkdir();body=b'renderer'
+            manifest={'files':[{'path':'component/a.mjs','url':'https://chatgpt.com/cdn/test.js','size':len(body),'sha256':hashlib.sha256(body).hexdigest()}]}
+            (assets/'runtime_manifest.json').write_text(json.dumps(manifest))
+            seed=assets/'runtime_seed'/'component';seed.mkdir(parents=True)
+            (seed/'a.mjs').write_bytes(b'tampered')
+            with patch('urllib.request.urlopen',return_value=Response(body)) as fetch:
+                ensure_runtime(base,assets);self.assertEqual(fetch.call_count,1)
+            self.assertEqual((base/'runtime'/'component'/'a.mjs').read_bytes(),body)
     def test_form_validation(self):
         self.assertEqual(validate_config(copy.deepcopy(app.DEFAULT)),app.DEFAULT)
         broken=copy.deepcopy(app.DEFAULT);broken['work']['model']=''

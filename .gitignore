@@ -8,6 +8,14 @@ release/
 artwork_source/
 assets/
 runtime/
+# The rendering resources shipped with the installer are versioned on purpose:
+# a first launch must not need the network. /assets and /runtime above stay
+# ignored, while anything under runtime_seed is tracked.
+!runtime_seed/
+!runtime_seed/assets/
+!runtime_seed/assets/**
+!runtime_seed/component/
+!runtime_seed/component/**
 downloads/
 config.json
 status.json
